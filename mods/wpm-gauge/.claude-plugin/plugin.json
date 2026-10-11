@@ -1,0 +1,7 @@
+{
+  "name": "wpm-gauge",
+  "version": "0.3.1",
+  "description": "Live words-per-minute gauge (5 coloured bars) under the prompt box",
+  "author": { "name": "fbandres" },
+  "types": "./types/index.d.ts"
+}

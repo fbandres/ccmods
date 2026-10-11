@@ -1,0 +1,17 @@
+{
+  "name": "ccmods",
+  "description": "Mods for Claude Code: small plugins that change Claude Code's own interface.",
+  "owner": { "name": "fbandres" },
+  "plugins": [
+    {
+      "name": "git-changes",
+      "source": "./mods/git-changes",
+      "description": "Live Source Control pane: changed files, status letters and +/- line counts. Toggle with /changes."
+    },
+    {
+      "name": "wpm-gauge",
+      "source": "./mods/wpm-gauge",
+      "description": "Words-per-minute gauge (5 coloured bars, streak peak, ⚡ at full speed) under the prompt box."
+    }
+  ]
+}

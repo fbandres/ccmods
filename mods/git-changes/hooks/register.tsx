@@ -94,7 +94,8 @@ async function refresh($: Engine) {
     const fresh = await untrackedStats($, parsed.files)
     // An edit to an already-changed or new file changes no status line: the key holds every source.
     const raw = [run.stdout, unstaged, staged, JSON.stringify([...fresh])].join('\0\0')
-    if (raw === lastRaw) return
+    // Unchanged output skips the write only while a status is kept: the session's state can be emptied under us.
+    if (raw === lastRaw && (await read($, status)) !== null) return
     lastRaw = raw
     const counted = withCounts(parsed, [parseNumstat(unstaged), parseNumstat(staged), fresh])
     await update($, status, () => counted)
@@ -219,6 +220,7 @@ function startTimer($: Engine) {
 
 async function show($: Engine) {
   startTimer($)
+  lastRaw = undefined // reopening always redraws from a fresh read
   await refresh($)
   await $.ui.open({ id: PANE, title: TITLE, columns: DOCK_COLUMNS })
 }
@@ -290,7 +292,6 @@ export const register: Register = on => {
     const hiddenCount = count - shown.length
     const added = now.files.reduce((sum, file) => sum + (file.added ?? 0), 0)
     const removed = now.files.reduce((sum, file) => sum + (file.removed ?? 0), 0)
-    const sync = now.ahead || now.behind ? `↑${now.ahead} ↓${now.behind}` : ''
     const divider = <Text dimColor>{'─'.repeat(width)}</Text>
 
     // Count columns line up across rows; dropped first when the pane is narrow.
@@ -301,12 +302,18 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Box justifyContent="space-between">
-          <Text>
+        <Box justifyContent="space-between" gap={2}>
+          <Text wrap="truncate-end">
             <Text bold>⎇ {now.isDetached ? `(${now.branch})` : now.branch}</Text>
             {isDirty && <Text color="warning"> ●</Text>}
           </Text>
-          {sync && <Text dimColor>{sync}</Text>}
+          {(now.ahead > 0 || now.behind > 0) && (
+            // A space after each triangle: fonts that draw it two columns wide never cover the count.
+            <Box gap={2} flexShrink={0}>
+              {now.ahead > 0 && <Text bold color="suggestion">{`▲ ${now.ahead}`}</Text>}
+              {now.behind > 0 && <Text bold color="warning">{`▼ ${now.behind}`}</Text>}
+            </Box>
+          )}
         </Box>
         {isDirty && (
           <Box justifyContent="space-between">

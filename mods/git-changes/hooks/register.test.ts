@@ -324,3 +324,59 @@ test('a deleted file is red and struck through', async ($, on) => {
   expect(name?.props.strikethrough).toBe(true)
   expect(await pane.findAll({ text: /^\-30$/ })).toHaveLength(2)
 })
+
+test('an emptied status is read again although git says the same', async ($, on) => {
+  mock.store(on, { shown: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({}))
+  // The session's state empties (a resume, a reload) until the plugin writes again.
+  let isEmptied = false
+  on('state.get', async (_$, e, next) => {
+    const held = await next(e)
+    return isEmptied && 'value' in held && held.value ? { value: { ...held.value, value: null } } : held
+  })
+  on('state.set', async (_$, e, next) => {
+    isEmptied = false
+    return next(e)
+  })
+  await runChanges($)
+
+  isEmptied = true
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /Reading git status/ })).toBeDefined()
+
+  await clock.advance(2000)
+  expect(await pane.find({ text: /main/ })).toBeDefined()
+})
+
+test('sync shows only the non-zero side as a coloured triangle', async ($, on) => {
+  mock.store(on, { shown: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  let git: Git = { stdout: CLEAN_HEAD + '# branch.upstream origin/main\0# branch.ab +1 -0\0' }
+  fakeGit(on, () => git)
+  await runChanges($)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect((await pane.findAll({ text: /^▲ 1$/ })).map(node => node.props.color)).toContain('suggestion')
+  expect(await pane.find({ text: /▼/ })).toBeUndefined()
+
+  git = { stdout: CLEAN_HEAD + '# branch.upstream origin/main\0# branch.ab +2 -3\0' }
+  await clock.advance(2000)
+  expect((await pane.findAll({ text: /^▲ 2$/ })).map(node => node.props.color)).toContain('suggestion')
+  expect((await pane.findAll({ text: /^▼ 3$/ })).map(node => node.props.color)).toContain('warning')
+})
+
+test('a long branch name is cut, never the sync counts', async ($, on) => {
+  mock.store(on, { shown: false })
+  mock.clock(on)
+  fakePanes(on)
+  const branch = 'feature/a-very-long-branch-name-that-cannot-fit-in-the-pane'
+  fakeGit(on, () => ({ stdout: `# branch.oid 1a2b\0# branch.head ${branch}\0# branch.ab +12 -3\0` }))
+  await runChanges($)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /^▲ 12$/ })).toBeDefined()
+  expect(await pane.find({ text: /^▼ 3$/ })).toBeDefined()
+})

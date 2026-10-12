@@ -292,9 +292,6 @@ export const register: Register = on => {
     const hiddenCount = count - shown.length
     const added = now.files.reduce((sum, file) => sum + (file.added ?? 0), 0)
     const removed = now.files.reduce((sum, file) => sum + (file.removed ?? 0), 0)
-    // Words beside the arrows while the branch name leaves room; a zero side is left out.
-    const branchWidth = 2 + now.branch.length + (now.isDetached ? 2 : 0) + (isDirty ? 2 : 0)
-    const syncWords = width - branchWidth >= 24
     const divider = <Text dimColor>{'─'.repeat(width)}</Text>
 
     // Count columns line up across rows; dropped first when the pane is narrow.
@@ -305,15 +302,16 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Box justifyContent="space-between">
-          <Text>
+        <Box justifyContent="space-between" gap={2}>
+          <Text wrap="truncate-end">
             <Text bold>⎇ {now.isDetached ? `(${now.branch})` : now.branch}</Text>
             {isDirty && <Text color="warning"> ●</Text>}
           </Text>
           {(now.ahead > 0 || now.behind > 0) && (
-            <Box gap={1}>
-              {now.ahead > 0 && <Text color="suggestion">{`↑${now.ahead}${syncWords ? ' to push' : ''}`}</Text>}
-              {now.behind > 0 && <Text color="warning">{`↓${now.behind}${syncWords ? ' to pull' : ''}`}</Text>}
+            // A space after each triangle: fonts that draw it two columns wide never cover the count.
+            <Box gap={2} flexShrink={0}>
+              {now.ahead > 0 && <Text bold color="suggestion">{`▲ ${now.ahead}`}</Text>}
+              {now.behind > 0 && <Text bold color="warning">{`▼ ${now.behind}`}</Text>}
             </Box>
           )}
         </Box>

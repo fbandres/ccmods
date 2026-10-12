@@ -56,6 +56,7 @@ Or install it yourself:
 
 - The pane opens by itself only in terminals about 144 columns or wider. Otherwise run `/changes`.
 - It's read-only: no staging, committing or diffs.
+- Claude Code fills the docked pane with its theme's `composerSidebarBackground` color, and a mod can't change that directly. In a VS Code-family terminal (VS Code, Cursor, …) the mod reads your editor theme on start and writes its terminal background into `~/.claude/themes/editor-match.json`. Pick **Match editor (git-changes)** once with `/theme`. An editor theme change applies from the next session.
 - Wide characters (CJK, emoji) in file names can push a row past its column.
 
 ## License

@@ -80,9 +80,10 @@ function fakeGit(on: On, git: () => Git) {
 
 /** Stands in for the surface: panes open placed unless `placed.value` is false. */
 function fakePanes(on: On) {
-  const placed = { value: true, isOpen: false }
-  on('ui.open', async () => {
+  const placed = { value: true, isOpen: false, columns: undefined as number | undefined }
+  on('ui.open', async ($, e) => {
     placed.isOpen = true
+    placed.columns = e.columns
     return { value: { isPlaced: true as const } }
   })
   on('ui.close', async () => {
@@ -119,11 +120,12 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`/changes opens the pane and lists files with their letters (${surface})`, async ($, on) => {
     mock.store(on, { shown: false })
     mock.clock(on)
-    fakePanes(on)
+    const panes = fakePanes(on)
     fakeGit(on, () => ({}))
 
     const { text } = await runChanges($)
     expect(text).toBe('Source Control pane shown.')
+    expect(panes.columns).toBe(53)
 
     const pane = await mountPane($.ui, surface)
     expect(await pane.find({ text: /main/ })).toBeDefined()

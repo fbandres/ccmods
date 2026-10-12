@@ -4,10 +4,13 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { FileChange, RepoStatus } from '../types'
 import type { LineStat } from './status'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
+import type { Colors, ThemeEntry } from './theme'
+import { DEFAULT_THEMES, isRecord, isThemeNamed, MAX_INCLUDES, parseJsonc, pickBackground, stringsOf, THEME_SLUG, themeFile } from './theme'
 
 const PANE = 'git-changes'
 const TITLE = 'Source Control'
 const INTERVAL_MS = 2000
+const DOCK_COLUMNS = 53 // the dock's opening width; a width the person drags to wins
 const REFRESH_TOOLS = ['Edit', 'Write', 'Bash'] as const
 const COMMAND = 'changes'
 const FALLBACK_COMMAND = 'git-changes' // if a built-in ever takes /changes
@@ -103,6 +106,91 @@ async function refresh($: Engine) {
   }
 }
 
+async function readJsonc($: Engine, path: string) {
+  try {
+    const text = await $.fs.read(path)
+    return typeof text === 'string' ? parseJsonc(text) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function dirOf(path: string) {
+  return path.slice(0, path.lastIndexOf('/'))
+}
+
+/** A theme file's colors, its `include` chain beneath them. */
+async function themeColors($: Engine, path: string, depth = 0): Promise<{ colors: Colors; type?: string }> {
+  const theme = await readJsonc($, path)
+  if (!isRecord(theme)) return { colors: {} }
+  const base =
+    typeof theme.include === 'string' && depth < MAX_INCLUDES
+      ? await themeColors($, `${dirOf(path)}/${theme.include.replace(/^\.\//, '')}`, depth + 1)
+      : { colors: {} }
+  const type = typeof theme.type === 'string' ? theme.type : base.type
+
+  return { colors: { ...base.colors, ...(isRecord(theme.colors) ? stringsOf(theme.colors) : {}) }, type }
+}
+
+/** The first extension under these folders that contributes a theme by this name. */
+async function findTheme($: Engine, folders: readonly string[], names: readonly string[]) {
+  for (const name of names) {
+    for (const folder of folders) {
+      const entries = await $.fs.list(folder).catch(() => [])
+      for (const entry of entries) {
+        if (entry.kind !== 'dir') continue
+        const extension = `${folder}/${entry.name}`
+        const manifest = await readJsonc($, `${extension}/package.json`)
+        const contributes = isRecord(manifest) && isRecord(manifest.contributes) ? manifest.contributes : {}
+        const themes = Array.isArray(contributes.themes) ? (contributes.themes as ThemeEntry[]) : []
+        const match = themes.find(theme => isRecord(theme) && typeof theme.path === 'string' && isThemeNamed(theme, name))
+        if (match) return { ...match, path: `${extension}/${match.path.replace(/^\.\//, '')}`, name }
+      }
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * Reads the VS Code family editor this session runs in (VS Code, Cursor, ...) and writes its
+ * terminal background into ~/.claude/themes/editor-match.json. Quietly does nothing elsewhere.
+ */
+async function syncEditorTheme($: Engine) {
+  const [program, askpass, home] = await Promise.all([
+    $.env.get('TERM_PROGRAM'),
+    $.env.get('VSCODE_GIT_ASKPASS_MAIN'),
+    $.env.get('HOME'),
+  ])
+  const cut = askpass?.indexOf('/extensions/git/') ?? -1
+  if (program !== 'vscode' || !askpass || cut < 0 || !home) return
+
+  const app = askpass.slice(0, cut) // .../Contents/Resources/app
+  const product = await readJsonc($, `${app}/product.json`)
+  if (!isRecord(product) || typeof product.nameShort !== 'string') return
+  const dataFolder = typeof product.dataFolderName === 'string' ? product.dataFolderName : '.vscode'
+
+  const userDirs = [`${home}/Library/Application Support/${product.nameShort}/User`, `${home}/.config/${product.nameShort}/User`]
+  let settings: unknown
+  for (const dir of userDirs) {
+    settings = await readJsonc($, `${dir}/settings.json`)
+    if (settings !== undefined) break
+  }
+  const all = isRecord(settings) ? settings : {}
+  const chosen = typeof all['workbench.colorTheme'] === 'string' ? [all['workbench.colorTheme']] : DEFAULT_THEMES
+
+  const theme = await findTheme($, [`${home}/${dataFolder}/extensions`, `${app}/extensions`], chosen)
+  if (!theme) return
+  const { colors, type } = await themeColors($, theme.path)
+  const background = pickBackground(colors, all['workbench.colorCustomizations'], theme.name)
+  if (!background) return
+
+  const isLight = type === 'light' || theme.uiTheme === 'vs' || theme.uiTheme === 'hc-light'
+  const path = `${home}/.claude/themes/${THEME_SLUG}.json`
+  const text = themeFile(background, isLight)
+  if ((await $.fs.read(path).catch(() => undefined)) !== text) await $.fs.write(path, text)
+}
+
 async function isPlaced($: Engine) {
   return (await $.ui.panes()).some(pane => pane.id === PANE && pane.isPlaced)
 }
@@ -132,13 +220,13 @@ function startTimer($: Engine) {
 async function show($: Engine) {
   startTimer($)
   await refresh($)
-  await $.ui.open({ id: PANE, title: TITLE })
+  await $.ui.open({ id: PANE, title: TITLE, columns: DOCK_COLUMNS })
 }
 
 /** On start: open at once, read git after, so a slow repo never holds the session. */
 async function showOnStart($: Engine) {
   startTimer($)
-  await $.ui.open({ id: PANE, title: TITLE })
+  await $.ui.open({ id: PANE, title: TITLE, columns: DOCK_COLUMNS })
   void refresh($).catch(() => {}) // the module may unload before git answers
 }
 
@@ -162,6 +250,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await registerCommand($)
     if ((await $.store.get('shown')) !== false && (await isRepo($))) await showOnStart($)
+    void syncEditorTheme($).catch(() => {}) // the pane's fill follows the editor; never holds the session
 
     return next(e)
   })

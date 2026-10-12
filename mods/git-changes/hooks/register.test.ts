@@ -324,3 +324,28 @@ test('a deleted file is red and struck through', async ($, on) => {
   expect(name?.props.strikethrough).toBe(true)
   expect(await pane.findAll({ text: /^\-30$/ })).toHaveLength(2)
 })
+
+test('an emptied status is read again although git says the same', async ($, on) => {
+  mock.store(on, { shown: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({}))
+  // The session's state empties (a resume, a reload) until the plugin writes again.
+  let isEmptied = false
+  on('state.get', async (_$, e, next) => {
+    const held = await next(e)
+    return isEmptied && 'value' in held && held.value ? { value: { ...held.value, value: null } } : held
+  })
+  on('state.set', async (_$, e, next) => {
+    isEmptied = false
+    return next(e)
+  })
+  await runChanges($)
+
+  isEmptied = true
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /Reading git status/ })).toBeDefined()
+
+  await clock.advance(2000)
+  expect(await pane.find({ text: /main/ })).toBeDefined()
+})

@@ -94,7 +94,8 @@ async function refresh($: Engine) {
     const fresh = await untrackedStats($, parsed.files)
     // An edit to an already-changed or new file changes no status line: the key holds every source.
     const raw = [run.stdout, unstaged, staged, JSON.stringify([...fresh])].join('\0\0')
-    if (raw === lastRaw) return
+    // Unchanged output skips the write only while a status is kept: the session's state can be emptied under us.
+    if (raw === lastRaw && (await read($, status)) !== null) return
     lastRaw = raw
     const counted = withCounts(parsed, [parseNumstat(unstaged), parseNumstat(staged), fresh])
     await update($, status, () => counted)
@@ -219,6 +220,7 @@ function startTimer($: Engine) {
 
 async function show($: Engine) {
   startTimer($)
+  lastRaw = undefined // reopening always redraws from a fresh read
   await refresh($)
   await $.ui.open({ id: PANE, title: TITLE, columns: DOCK_COLUMNS })
 }

@@ -292,7 +292,9 @@ export const register: Register = on => {
     const hiddenCount = count - shown.length
     const added = now.files.reduce((sum, file) => sum + (file.added ?? 0), 0)
     const removed = now.files.reduce((sum, file) => sum + (file.removed ?? 0), 0)
-    const sync = now.ahead || now.behind ? `↑${now.ahead} ↓${now.behind}` : ''
+    // Words beside the arrows while the branch name leaves room; a zero side is left out.
+    const branchWidth = 2 + now.branch.length + (now.isDetached ? 2 : 0) + (isDirty ? 2 : 0)
+    const syncWords = width - branchWidth >= 24
     const divider = <Text dimColor>{'─'.repeat(width)}</Text>
 
     // Count columns line up across rows; dropped first when the pane is narrow.
@@ -308,7 +310,12 @@ export const register: Register = on => {
             <Text bold>⎇ {now.isDetached ? `(${now.branch})` : now.branch}</Text>
             {isDirty && <Text color="warning"> ●</Text>}
           </Text>
-          {sync && <Text dimColor>{sync}</Text>}
+          {(now.ahead > 0 || now.behind > 0) && (
+            <Box gap={1}>
+              {now.ahead > 0 && <Text color="suggestion">{`↑${now.ahead}${syncWords ? ' to push' : ''}`}</Text>}
+              {now.behind > 0 && <Text color="warning">{`↓${now.behind}${syncWords ? ' to pull' : ''}`}</Text>}
+            </Box>
+          )}
         </Box>
         {isDirty && (
           <Box justifyContent="space-between">

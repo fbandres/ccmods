@@ -9,7 +9,7 @@ A live Source Control pane for Claude Code: see which files changed, and by how 
 - Lists every changed file in the current repo, with a status letter: `M` modified, `A` added, `D` deleted, `R` renamed, `U` untracked, `!` conflict.
 - Shows lines added (`+N`, green) and removed (`-N`, red) per file and in total. Binary files show `bin`.
 - Colours file names by status, and strikes through deleted files.
-- Shows the branch, a `●` when the tree is dirty, and `↑ ↓` when you have unpushed or unpulled commits.
+- Shows the branch, a `●` when the tree is dirty, and `↑1 to push` / `↓2 to pull` when you have unpushed or unpulled commits (arrows only in a narrow pane).
 - Refreshes right after Claude edits files, and every 2 seconds while the pane is visible.
 
 ## Install

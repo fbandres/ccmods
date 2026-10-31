@@ -1,6 +1,6 @@
 # git-changes
 
-A live Source Control pane for Claude Code: see which files changed, and by how much, without running `git status`.
+A live Source Control pane for Claude Code: see which files changed, and by how much, without running `git status`. If the project keeps its GitHub issues in a `<repo>-issues` repo, the pane shows those too.
 
 ![git-changes pane](screenshot.png)
 
@@ -11,6 +11,8 @@ A live Source Control pane for Claude Code: see which files changed, and by how 
 - Colours file names by status, and strikes through deleted files.
 - Shows the branch, a `●` when the tree is dirty, and a blue `▲ 1` / yellow `▼ 2` when you have unpushed or unpulled commits.
 - Refreshes right after Claude edits files, and every 2 seconds while the pane is visible.
+- Long lists scroll under a pinned header: mouse wheel, or PgUp/PgDn once the pane is focused.
+- **Issues tab (optional, automatic).** When `origin` is `github.com/<owner>/<repo>` and a repo named `<owner>/<repo>-issues` exists, a `[Changes 3]  Issues 5` tab bar appears. The Issues tab lists the open issues, most recently updated first, with number, title, first label and age. Click an issue, or arrow to it and press Enter, to open it in your browser. With no such repo, the pane has no tabs and looks as it always did.
 
 ## Install
 
@@ -32,11 +34,13 @@ Or install it yourself:
 ## Usage
 
 - `/changes` shows or hides the pane. The choice is remembered on this machine for future sessions.
+- `/changes issues` turns the Issues tab off, or on again (remembered on this machine). When it can't show the tab, it says why: no GitHub origin, no `-issues` repo, `gh` not installed, or `gh` not logged in.
 - If a future Claude Code built-in ever takes `/changes`, the mod registers `/git-changes` instead, which does the same.
 
 ## How it works
 
 - **Refresh:** after `Edit`, `Write` and `Bash` tool calls, every 2 s while the pane is placed, and when it opens.
+- **Issues:** `gh repo view <owner>/<repo>-issues` once per session finds the repo, then `gh issue list --state open --search "sort:updated-desc" --limit 100` runs as soon as the repo is found, every 60 s while the pane is visible, and right away when you click the Issues tab. If GitHub is unreachable at start, it tries again every minute. A failed fetch keeps the last list and shows the error in the tab.
 - **Git:** three calls run in parallel, all with `--no-optional-locks` so they never block your own `git commit`:
   `git status --porcelain=v2 -b -z -uall`, `git diff --numstat -z` and `git diff --cached --numstat -z`.
 - **New files:** git has no diff for them, so their lines are counted from disk (up to 50 files, 256 KB each). A file containing a NUL byte counts as binary.
@@ -55,7 +59,9 @@ Or install it yourself:
 ## Limits
 
 - The pane opens by itself only in terminals about 144 columns or wider. Otherwise run `/changes`.
-- It's read-only: no staging, committing or diffs.
+- It's read-only: no staging, committing or diffs, and no editing of issues.
+- The Issues tab needs the [GitHub CLI](https://cli.github.com) installed and logged in (`gh auth login`). It only recognises `github.com` remotes and only looks at `origin`. It lists up to 100 issues (the tab reads `Issues 100+` past that).
+- An issue opens with `xdg-open` (Linux) or `open` (macOS). If neither works, its URL is copied to the clipboard instead.
 - Claude Code fills the docked pane with its theme's `composerSidebarBackground` color, and a mod can't change that directly. In a VS Code-family terminal (VS Code, Cursor, …) the mod reads your editor theme on start and writes its terminal background into `~/.claude/themes/editor-match.json`. Pick **Match editor (git-changes)** once with `/theme`. An editor theme change applies from the next session.
 - Wide characters (CJK, emoji) in file names can push a row past its column.
 

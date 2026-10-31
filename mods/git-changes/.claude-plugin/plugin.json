@@ -1,7 +1,7 @@
 {
   "name": "git-changes",
-  "version": "0.2.1",
-  "description": "Live Source Control pane: the repo's changed files, toggled with /changes",
+  "version": "0.3.0",
+  "description": "Live Source Control pane: the repo's changed files and the project's open issues, toggled with /changes",
   "author": {
     "name": "fbandres"
   },

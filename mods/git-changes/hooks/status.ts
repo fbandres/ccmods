@@ -1,4 +1,5 @@
 import type { FileChange, Letter, RepoStatus } from '../types'
+import { cutTo, widthOf } from './text'
 
 export type LineStat = { added: number; removed: number; isBinary: boolean }
 
@@ -76,13 +77,6 @@ export function parseStatus(raw: string, now: number): RepoStatus {
   }
 }
 
-/** Cuts `text` to `width`, ending in `…`, keeping `keep` chars at the end. */
-function cut(text: string, width: number, keep = ''): string {
-  if (text.length <= width) return text
-  const room = width - keep.length - 1
-  return room > 0 ? text.slice(0, room) + '…' + keep : text.slice(0, width - 1) + '…'
-}
-
 /**
  * The row's file name and its dim parent folder, fitted to `width`
  * columns (a space between them). The folder is cut first, then dropped,
@@ -95,12 +89,12 @@ export function fitRow(path: string, width: number): { name: string; dir: string
   const dot = base.lastIndexOf('.')
   const ext = dot > 0 ? base.slice(dot) : ''
 
-  if (base.length >= width) return { name: cut(base, width, ext), dir: '' }
+  if (widthOf(base) >= width) return { name: cutTo(base, width, ext), dir: '' }
 
-  const dirRoom = width - base.length - 1
+  const dirRoom = width - widthOf(base) - 1
   if (!folder || dirRoom < 4) return { name: base, dir: '' }
 
-  return { name: base, dir: cut(folder, dirRoom) }
+  return { name: base, dir: cutTo(folder, dirRoom) }
 }
 
 /** `git diff --numstat -z` output, by path. A rename counts under its new path. */

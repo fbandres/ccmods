@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { countLines, fitRow, parseNumstat, parseStatus, pickLetter, withCounts } from './status'
+import { widthOf } from './text'
 
 const HEAD = '# branch.oid 1a2b3c4d5e6f\0# branch.head main\0'
 const NOW = 1_760_000_000_000
@@ -138,4 +139,14 @@ test('withCounts: staged and unstaged add up per file; unknown files stay bare',
     { path: 'logo.png', letter: 'M', added: 0, removed: 0, isBinary: true },
     { path: 'untouched.ts', letter: 'M' },
   ])
+})
+
+test('fitRow: wide file names are cut by columns, keeping the extension', () => {
+  const row = fitRow('ドキュメント/四半期レビュー資料.pptx', 16)
+  expect(row.dir).toBe('')
+  expect(row.name.endsWith('….pptx')).toBe(true)
+  expect(widthOf(row.name)).toBeLessThanOrEqual(16)
+  const both = fitRow('資料/メモ.md', 20)
+  expect(both).toEqual({ name: 'メモ.md', dir: '資料' })
+  expect(widthOf(fitRow('フォルダ名がとても長い/メモ.md', 16).dir) + 1 + widthOf('メモ.md')).toBeLessThanOrEqual(16)
 })

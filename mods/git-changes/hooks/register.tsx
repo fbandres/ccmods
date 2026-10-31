@@ -4,9 +4,10 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { FileChange, IssuesState, RepoStatus } from '../types'
 import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
 import type { LineStat } from './status'
-import { ageOf, fitIssueRow } from './issues'
+import { ageOf, fitIssueRow, tabTexts } from './issues'
 import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
+import { widthOf } from './text'
 import type { Colors, ThemeEntry } from './theme'
 import { DEFAULT_THEMES, isRecord, isThemeNamed, MAX_INCLUDES, parseJsonc, pickBackground, stringsOf, THEME_SLUG, themeFile } from './theme'
 
@@ -41,8 +42,15 @@ type Tab = 'changes' | 'issues'
 let tab: Tab = 'changes'
 /** Each tab's first shown row: the mod scrolls its list itself, under a pinned header. */
 const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
-/** What the last drawing measured, for ui.scroll: the list's length, its rows of room, and its first body row. */
-const drawn = { length: 0, room: 1, top: 0, bodyRows: 1 }
+/**
+ * What each tab's last drawing measured, for ui.scroll and ui.focus: the list's
+ * length, its rows of room, and its first body row. Per tab, so a hook that
+ * fires between a tab press and the redraw never uses the other tab's room.
+ */
+const drawn: Record<Tab, { length: number; room: number; top: number; bodyRows: number }> = {
+  changes: { length: 0, room: 1, top: 0, bodyRows: 1 },
+  issues: { length: 0, room: 1, top: 0, bodyRows: 1 },
+}
 
 /** The number of the issue row the ring was last on; a number survives a fetch that re-sorts the list. */
 let focusedIssue: number | undefined
@@ -368,7 +376,14 @@ async function fetchIssues($: Engine, isUrgent = false): Promise<void> {
       return
     }
     if (run.stdout === lastIssuesRaw && (await read($, issues)) !== null) return
-    const list = parseIssues(run.stdout)
+    let list: ReturnType<typeof parseIssues>
+    try {
+      list = parseIssues(run.stdout)
+    } catch {
+      lastIssuesRaw = undefined
+      await failed('GitHub: unexpected reply from gh')
+      return
+    }
     lastIssuesRaw = run.stdout
     await update($, issues, () => ({ issues: list, isCapped: list.length >= ISSUES_LIMIT, updatedAt: Date.now() }))
   } catch {
@@ -448,7 +463,7 @@ export const register: Register = on => {
     await registerCommand($)
     const isGit = await isRepo($)
     if (isGit && (await $.store.get('shown')) !== false) await showOnStart($)
-    if (isGit) void detectIssues($).catch(() => {}) // GitHub never holds the session
+    if (isGit && e.isInteractive) void detectIssues($).catch(() => {}) // GitHub never holds the session; -p and the SDK skip it
     void syncEditorTheme($).catch(() => {}) // the pane's fill follows the editor; never holds the session
 
     return next(e)
@@ -476,9 +491,10 @@ export const register: Register = on => {
 
   // The header stays: the engine's window never moves, the mod moves its own list and draws again.
   on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    if (e.pointer && e.pointer.row < drawn.top) return {} // a wheel over the header
-    const by = stepOf(e.by, drawn.bodyRows, drawn.room)
-    const next = scrolled(offsets[tab], by, drawn.length, drawn.room)
+    const measured = drawn[tab]
+    if (e.pointer && e.pointer.row < measured.top) return {} // a wheel over the header
+    const by = stepOf(e.by, measured.bodyRows, measured.room)
+    const next = scrolled(offsets[tab], by, measured.length, measured.room)
     if (next !== offsets[tab]) {
       offsets[tab] = next
       await update($, status, now => now && { ...now }) // draws again
@@ -498,7 +514,7 @@ export const register: Register = on => {
     const number = /^issue-(\d+)$/.exec(e.element ?? '')?.[1]
     const arrived = e.element === 'issues-more' ? 'after' : e.element === 'tab-issues' ? 'before' : indexOf(Number(number))
     const previous = indexOf(focusedIssue)
-    const window = windowOf(items.length, offsets.issues, drawn.room)
+    const window = windowOf(items.length, offsets.issues, drawn.issues.room)
     const move = e.origin.kind === 'person' ? wrapMove(previous, arrived, window) : 0
     if (move === 0) {
       focusedIssue = number === undefined ? undefined : Number(number)
@@ -507,7 +523,7 @@ export const register: Register = on => {
     const stay = items[previous]
     const target = items[previous + move]
     if (!stay || !target) return next(e)
-    offsets.issues = followed(offsets.issues, previous + move, items.length, drawn.room)
+    offsets.issues = followed(offsets.issues, previous + move, items.length, drawn.issues.room)
     focusedIssue = target.number
     await update($, issues, now => now && { ...now }) // draws the new row
     const key = `issue-${target.number}`
@@ -551,19 +567,20 @@ export const register: Register = on => {
     )
 
     const issuesCount = !known ? '…' : known.isCapped ? `${ISSUES_LIMIT}+` : String(known.issues.length)
-    const tabButton = (which: Tab, name: string, n: string, onPress: () => void) => (
+    const texts = tabTexts(width, { changes: String(count), issues: issuesCount }, tab)
+    const tabButton = (which: Tab, onPress: () => void) => (
       <Button key={`tab-${which}`} plain onPress={onPress}>
-        {tab === which ? <Text bold>{`[${name} ${n}]`}</Text> : <Text dimColor>{` ${name} ${n} `}</Text>}
+        {tab === which ? <Text bold>{texts[which]}</Text> : <Text dimColor>{texts[which]}</Text>}
       </Button>
     )
     const tabBar = hasTabs && (
       <Box gap={1}>
-        {tabButton('changes', 'Changes', String(count), () => {
+        {tabButton('changes', () => {
           tab = 'changes'
           focusedIssue = undefined
           redraw()
         })}
-        {tabButton('issues', 'Issues', issuesCount, () => {
+        {tabButton('issues', () => {
           tab = 'issues'
           focusedIssue = undefined
           redraw()
@@ -583,7 +600,7 @@ export const register: Register = on => {
       const room = listRoom(bodyRows, above + 2) // + divider, footer
       const window = windowOf(items.length, offsets.issues, room)
       offsets.issues = window.start
-      Object.assign(drawn, { length: items.length, room, top: above, bodyRows })
+      Object.assign(drawn.issues, { length: items.length, room, top: above, bodyRows })
       const listUrl = `https://github.com/${detection.target}/issues`
       const at = Date.now()
 
@@ -593,6 +610,7 @@ export const register: Register = on => {
           {tabBar}
           {divider}
           {known?.error && <Text color="error">{known.error}</Text>}
+          {!known && <Text dimColor>Reading issues…</Text>}
           {known && items.length === 0 && (
             <Box justifyContent="center">
               <Text color="success">✔ No open issues</Text>
@@ -601,8 +619,8 @@ export const register: Register = on => {
           {window.above > 0 && <Text dimColor> ↑ {window.above} above</Text>}
           {items.slice(window.start, window.end).map(issue => {
             const row = fitIssueRow(issue, width, ageOf(issue.updatedAt, at))
-            const tail = row.label.length + (row.label && row.age ? 1 : 0) + row.age.length
-            const pad = tail ? ' '.repeat(Math.max(1, width - row.head.length - row.title.length - tail)) : ''
+            const tail = widthOf(row.label) + (row.label && row.age ? 1 : 0) + row.age.length
+            const pad = tail ? ' '.repeat(Math.max(1, width - row.head.length - widthOf(row.title) - tail)) : ''
             return (
               <Button key={`issue-${issue.number}`} plain onPress={press => void openUrl($, issue.url, press.surface)}>
                 <Text wrap="truncate-end">{`${row.head}${row.title}${pad}`}</Text>
@@ -630,7 +648,7 @@ export const register: Register = on => {
     const room = listRoom(bodyRows, above + 2) // + divider, footer
     const window = windowOf(count, offsets.changes, room)
     offsets.changes = window.start // a list that shrank pulls the window back
-    Object.assign(drawn, { length: count, room, top: above, bodyRows })
+    Object.assign(drawn.changes, { length: count, room, top: above, bodyRows })
     const shown = now.files.slice(window.start, window.end)
 
     // Count columns line up across rows; dropped first when the pane is narrow.

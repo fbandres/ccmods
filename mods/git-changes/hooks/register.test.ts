@@ -60,8 +60,10 @@ type Git = {
 
 type Gh = {
   loggedOut?: boolean
-  /** `gh repo view`: found, missing (not found), or down (network). Default found. */
-  repo?: 'found' | 'missing' | 'down'
+  /** `gh repo view`: found, missing (not found), down (network) or hang (still running at the timeout). Default found. */
+  repo?: 'found' | 'missing' | 'down' | 'hang'
+  /** `gh auth status` fails although the token is fine (a network check failing). */
+  authBroken?: boolean
   /** When set, `gh repo view` waits for it before answering. */
   gate?: Promise<void>
   /** `gh issue list` JSON; default `[]`. */
@@ -89,12 +91,14 @@ function issuesJson(count: number, labels = ['bug']) {
 async function answerGh(gh: Gh | undefined, argv: readonly string[]) {
   if (!gh) return { deny: 'gh: command not found' }
   const loggedOutText = 'To get started with GitHub CLI, please run:  gh auth login'
-  if (argv[1] === 'auth') return gh.loggedOut ? ran(1, '', 'You are not logged into any GitHub hosts. To log in, run: gh auth login') : ran(0, '', '')
+  if (argv[1] === '--version') return ran(0, 'gh version 2.45.0\n', '')
+  if (argv[1] === 'auth') return gh.loggedOut || gh.authBroken ? ran(1, '', 'You are not logged into any GitHub hosts. To log in, run: gh auth login') : ran(0, '', '')
   if (argv[1] === 'repo') {
     if (gh.gate) await gh.gate
     if (gh.loggedOut) return ran(4, '', loggedOutText)
     if (gh.repo === 'missing') return ran(1, '', `GraphQL: Could not resolve to a Repository with the name '${argv[3]}'. (repository)`)
     if (gh.repo === 'down') return ran(1, '', 'error connecting to api.github.com')
+    if (gh.repo === 'hang') return { deny: 'gh is still running after 30000 ms' }
     return ran(0, '{"name":"oscp-app-issues"}', '')
   }
   if (argv[1] === 'issue') return gh.listError ? ran(1, '', gh.listError) : ran(0, gh.list ?? '[]', '')
@@ -167,7 +171,7 @@ function fakePanes(on: On) {
   return placed
 }
 
-const mountPane = (ui: EngineMount, surface: 'terminal' | 'desktop', bodyRows = 20) =>
+const mountPane = (ui: EngineMount, surface: 'terminal' | 'desktop', bodyRows = 20, bodyColumns = 40) =>
   ui.mount({
     plugin: PLUGIN,
     surface,
@@ -176,7 +180,7 @@ const mountPane = (ui: EngineMount, surface: 'terminal' | 'desktop', bodyRows = 
     props: {
       title: 'Source Control',
       isFocused: false,
-      bodyColumns: 40,
+      bodyColumns,
       placement: 'dock',
       scroll: { offset: 0, bodyRows },
     } as never,
@@ -929,4 +933,83 @@ test('a pane drawn before detection finishes gains the tab bar when issues arriv
   gate.release()
   await settle()
   expect(await pane.find({ text: /^ Issues 4 $/ })).toBeDefined()
+})
+
+test('a gh call that times out during detection retries instead of claiming gh is missing', async ($, on) => {
+  fakeStore(on, { issues: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  let gh: Gh = { repo: 'hang' }
+  const calls = fakeGit(on, () => ({ gh }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'issues')).text).toBe('Issues tab on; GitHub is unreachable right now, retrying every minute.')
+  gh = { list: issuesJson(1) }
+  await clock.advance(60_000)
+  await settle()
+  expect(ghRuns(calls, 'issue')).toHaveLength(1)
+})
+
+test('an offline start is not mistaken for logged out when gh auth status fails', async ($, on) => {
+  fakeStore(on, { issues: false })
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { repo: 'down', authBroken: true } }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'issues')).text).toBe('Issues tab on; GitHub is unreachable right now, retrying every minute.')
+})
+
+test('a fetch error never shows the issues repo name', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  let gh: Gh = { list: issuesJson(2) }
+  fakeGit(on, () => ({ gh }))
+  await startSession($, on)
+  gh = { listError: `GraphQL: Could not resolve to a Repository with the name '${TARGET}'. (repository)` }
+  await clock.advance(60_000)
+  await settle()
+
+  const pane = await mountPane($.ui, 'terminal')
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ text: /GitHub: issues repo not found or no access/ })).toBeDefined()
+  expect(await pane.find({ text: /oscp-app-issues/ })).toBeUndefined()
+})
+
+test('turning issues off while detection is still running keeps them off', async ($, on) => {
+  fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gate = held()
+  const calls = fakeGit(on, () => ({ gh: { gate: gate.promise, list: issuesJson(2) } }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'issues')).text).toBe('Issues tab hidden.')
+  gate.release()
+  await settle()
+  expect(ghRuns(calls, 'issue')).toHaveLength(0)
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ key: 'tab-issues' })).toBeUndefined()
+})
+
+test('an issue row with no label or age never runs past a narrow pane', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const list = JSON.stringify([
+    { number: 1234, title: 'A long title that has to be cut short', labels: [], updatedAt: 'garbage', url: `https://github.com/${TARGET}/issues/1234` },
+  ])
+  fakeGit(on, () => ({ gh: { list } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal', 20, 20)
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+  await pane.redraw()
+  const row = await pane.find({ key: 'issue-1234' })
+  expect(row).toBeDefined()
+  expect(row!.text.length).toBeLessThanOrEqual(20)
 })

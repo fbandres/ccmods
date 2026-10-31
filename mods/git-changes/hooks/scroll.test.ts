@@ -48,14 +48,15 @@ test('stepOf: wheel ticks pass through, engine pages become list pages', () => {
   expect(stepOf(0, 52, 8)).toBe(0)
 })
 
-test('wrapMove: the focus ring wrapping at an edge with rows beyond it is a one-row move', () => {
+test('wrapMove: only the ring stepping off an edge row onto its neighbour button is a one-row move', () => {
   const middle = windowOf(40, 14, 8) // rows 14..19 show, rows hide above and below
-  expect(wrapMove(19, 14, middle)).toBe(1) // ↓ past the last shown row
-  expect(wrapMove(14, 19, middle)).toBe(-1) // ↑ past the first
+  expect(wrapMove(19, 'after', middle)).toBe(1) // ↓ from the last row onto the more row
+  expect(wrapMove(14, 'before', middle)).toBe(-1) // ↑ from the first row onto the Issues tab
   expect(wrapMove(14, 15, middle)).toBe(0) // an ordinary step
-  expect(wrapMove(19, -1, middle)).toBe(1) // ↓ from the last row onto a non-row (the more row, a tab)
-  expect(wrapMove(14, -1, middle)).toBe(-1) // ↑ from the first row onto a tab
+  expect(wrapMove(19, 14, middle)).toBe(0) // a click on the first row: not a wrap
+  expect(wrapMove(14, 19, middle)).toBe(0) // a click on the last row
+  expect(wrapMove(16, 'after', middle)).toBe(0) // a click on the more row from mid-list
   const end = windowOf(40, 33, 8) // nothing below
-  expect(wrapMove(39, 33, end)).toBe(0) // a real wrap: let it be
+  expect(wrapMove(39, 'after', end)).toBe(0)
   expect(wrapMove(-1, 33, end)).toBe(0) // first focus
 })

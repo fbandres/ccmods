@@ -40,7 +40,7 @@ Or install it yourself:
 ## How it works
 
 - **Refresh:** after `Edit`, `Write` and `Bash` tool calls, every 2 s while the pane is placed, and when it opens.
-- **Issues:** `gh repo view <owner>/<repo>-issues` once per session finds the repo, then `gh issue list --state open --search "sort:updated-desc" --limit 100` runs when the pane opens, every 60 s while it is visible, and right away when you click the Issues tab. If GitHub is unreachable at start, it tries again every minute. A failed fetch keeps the last list and shows the error in the tab.
+- **Issues:** `gh repo view <owner>/<repo>-issues` once per session finds the repo, then `gh issue list --state open --search "sort:updated-desc" --limit 100` runs as soon as the repo is found, every 60 s while the pane is visible, and right away when you click the Issues tab. If GitHub is unreachable at start, it tries again every minute. A failed fetch keeps the last list and shows the error in the tab.
 - **Git:** three calls run in parallel, all with `--no-optional-locks` so they never block your own `git commit`:
   `git status --porcelain=v2 -b -z -uall`, `git diff --numstat -z` and `git diff --cached --numstat -z`.
 - **New files:** git has no diff for them, so their lines are counted from disk (up to 50 files, 256 KB each). A file containing a NUL byte counts as binary.

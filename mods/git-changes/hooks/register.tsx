@@ -44,8 +44,8 @@ const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
 /** What the last drawing measured, for ui.scroll: the list's length, its rows of room, and its first body row. */
 const drawn = { length: 0, room: 1, top: 0, bodyRows: 1 }
 
-/** The issue row the ring was last on, as an index into the list; -1 for none. */
-let focusedIssue = -1
+/** The number of the issue row the ring was last on; a number survives a fetch that re-sorts the list. */
+let focusedIssue: number | undefined
 
 /** Opens `url` in the browser: xdg-open (Linux), then open (macOS), else copies it. */
 async function openUrl($: Engine, url: string, surface: unknown) {
@@ -301,34 +301,48 @@ function firstLine(text: string) {
   return text.split('\n')[0].trim()
 }
 
+/** Bumped by every detection and by turning issues off: a slower, older detection then drops its answer. */
+let detectRun = 0
+
 /** Finds `<owner>/<repo>-issues` from origin; on success fetches at once (not awaited). */
 async function detectIssues($: Engine) {
+  const run = ++detectRun
+  const settle = (found: Detection) => {
+    if (run !== detectRun) return false // turned off, or a newer detection, meanwhile
+    detection = found
+    return true
+  }
   if ((await $.store.get('issues')) === false) {
-    detection = { kind: 'off' }
+    settle({ kind: 'off' })
     return
   }
   const origin = await $.process.run(['git', 'remote', 'get-url', 'origin']).catch(() => undefined)
   const target = origin?.exitCode === 0 ? issuesRepoOf(origin.stdout) : undefined
   if (!target) {
-    detection = { kind: 'none', reason: 'origin is not a GitHub repo' }
+    settle({ kind: 'none', reason: 'origin is not a GitHub repo' })
     return
   }
   let view: { exitCode: number; stderr: string }
   try {
     view = await $.process.run(['gh', 'repo', 'view', target, '--json', 'name'])
   } catch {
-    detection = { kind: 'none', reason: 'gh is not installed' }
+    // A missing gh and one still running at the timeout both reject: ask gh itself, briefly.
+    const isInstalled = await $.process.run(['gh', '--version'], { timeoutMs: 5000 } as never).then(
+      () => true,
+      () => false,
+    )
+    settle(isInstalled ? { kind: 'retrying' } : { kind: 'none', reason: 'gh is not installed' })
     return
   }
   if (view.exitCode === 0) {
-    detection = { kind: 'detected', target }
-    void fetchIssues($).catch(() => {})
+    if (settle({ kind: 'detected', target })) void fetchIssues($).catch(() => {})
     return
   }
-  const auth = await $.process.run(['gh', 'auth', 'status']).catch(() => undefined)
-  if (!auth || auth.exitCode !== 0) detection = { kind: 'none', reason: 'gh is not logged in (run: gh auth login)' }
-  else if (classifyGhFailure(view.stderr) === 'not-found') detection = { kind: 'none', reason: `${target} not found or no access` }
-  else detection = { kind: 'retrying' }
+  // gh's own words decide: exit 4 or "gh auth login" is logged out, a missing repo is final, the rest retries.
+  const failure = view.exitCode === 4 ? 'logged-out' : classifyGhFailure(view.stderr)
+  if (failure === 'logged-out') settle({ kind: 'none', reason: 'gh is not logged in (run: gh auth login)' })
+  else if (failure === 'not-found') settle({ kind: 'none', reason: `${target} not found or no access` })
+  else settle({ kind: 'retrying' })
 }
 
 /** Reads the open issues; a failure keeps the last list and sets `error`. */
@@ -348,7 +362,9 @@ async function fetchIssues($: Engine, isUrgent = false): Promise<void> {
     ])
     if (run.exitCode !== 0) {
       lastIssuesRaw = undefined
-      await failed(`GitHub: ${firstLine(run.stderr)}`)
+      // gh names the repo in its errors; the pane never shows it.
+      const said = firstLine(run.stderr).split(detection.target).join('the issues repo')
+      await failed(classifyGhFailure(run.stderr) === 'not-found' ? 'GitHub: issues repo not found or no access' : `GitHub: ${said}`)
       return
     }
     if (run.stdout === lastIssuesRaw && (await read($, issues)) !== null) return
@@ -396,7 +412,9 @@ async function toggleIssues($: Engine) {
   const isOn = (await $.store.get('issues')) === false
   await $.store.set('issues', isOn)
   if (!isOn) {
+    detectRun++ // a detection still running drops its answer
     detection = { kind: 'off' }
+    focusedIssue = undefined
     tab = 'changes'
     lastIssuesRaw = undefined
     await update($, issues, () => null)
@@ -471,22 +489,27 @@ export const register: Register = on => {
 
   // Arrows move the ring between drawn rows; past an edge with rows beyond it, the list follows.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
-    const number = /^issue-(\d+)$/.exec(e.element ?? '')?.[1]
-    if (tab !== 'issues') return next(e)
-    const items = (await read($, issues))?.issues ?? []
-    const index = number === undefined ? -1 : items.findIndex(issue => issue.number === Number(number))
-    const window = windowOf(items.length, offsets.issues, drawn.room)
-    const move = e.origin.kind === 'person' ? wrapMove(focusedIssue, index, window) : 0
-    if (move === 0) {
-      focusedIssue = index
+    if (tab !== 'issues') {
+      focusedIssue = undefined
       return next(e)
     }
-    const stay = items[focusedIssue]
-    const target = focusedIssue + move
-    offsets.issues = followed(offsets.issues, target, items.length, drawn.room)
-    focusedIssue = target
+    const items = (await read($, issues))?.issues ?? []
+    const indexOf = (number: number | undefined) => items.findIndex(issue => issue.number === number)
+    const number = /^issue-(\d+)$/.exec(e.element ?? '')?.[1]
+    const arrived = e.element === 'issues-more' ? 'after' : e.element === 'tab-issues' ? 'before' : indexOf(Number(number))
+    const previous = indexOf(focusedIssue)
+    const window = windowOf(items.length, offsets.issues, drawn.room)
+    const move = e.origin.kind === 'person' ? wrapMove(previous, arrived, window) : 0
+    if (move === 0) {
+      focusedIssue = number === undefined ? undefined : Number(number)
+      return next(e)
+    }
+    const stay = items[previous]
+    const target = items[previous + move]
+    offsets.issues = followed(offsets.issues, previous + move, items.length, drawn.room)
+    focusedIssue = target.number
     await update($, issues, now => now && { ...now }) // draws the new row
-    const key = `issue-${items[target].number}`
+    const key = `issue-${target.number}`
     $.clock.after(REFOCUS_MS, () => void $.ui.focus({ requestId: PANE, key } as never).catch(() => {}))
 
     return next({ ...e, element: `issue-${stay.number}` }) // the ring waits on the row it left
@@ -536,10 +559,12 @@ export const register: Register = on => {
       <Box gap={1}>
         {tabButton('changes', 'Changes', String(count), () => {
           tab = 'changes'
+          focusedIssue = undefined
           redraw()
         })}
         {tabButton('issues', 'Issues', issuesCount, () => {
           tab = 'issues'
+          focusedIssue = undefined
           redraw()
           void fetchIssues($, true).catch(() => {})
         })}
@@ -576,10 +601,10 @@ export const register: Register = on => {
           {items.slice(window.start, window.end).map(issue => {
             const row = fitIssueRow(issue, width, ageOf(issue.updatedAt, at))
             const tail = row.label.length + (row.label && row.age ? 1 : 0) + row.age.length
-            const pad = ' '.repeat(Math.max(1, width - row.head.length - row.title.length - tail))
+            const pad = tail ? ' '.repeat(Math.max(1, width - row.head.length - row.title.length - tail)) : ''
             return (
               <Button key={`issue-${issue.number}`} plain onPress={press => void openUrl($, issue.url, press.surface)}>
-                <Text>{`${row.head}${row.title}${pad}`}</Text>
+                <Text wrap="truncate-end">{`${row.head}${row.title}${pad}`}</Text>
                 {row.label && <Text dimColor>{row.label}</Text>}
                 {row.label && row.age ? ' ' : ''}
                 {row.age}

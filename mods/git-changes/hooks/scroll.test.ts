@@ -1,0 +1,40 @@
+import { expect, test } from 'claude-code/testing'
+
+import { followed, scrolled, windowOf } from './scroll'
+
+test('windowOf: everything fits, no markers', () => {
+  expect(windowOf(5, 0, 8)).toEqual({ start: 0, end: 5, above: 0, below: 0 })
+  expect(windowOf(5, 3, 8)).toEqual({ start: 0, end: 5, above: 0, below: 0 }) // offset ignored when it fits
+})
+
+test('windowOf: top, middle, end of a long list', () => {
+  expect(windowOf(40, 0, 8)).toEqual({ start: 0, end: 7, above: 0, below: 33 })
+  expect(windowOf(40, 14, 8)).toEqual({ start: 14, end: 20, above: 14, below: 20 })
+  expect(windowOf(40, 33, 8)).toEqual({ start: 33, end: 40, above: 33, below: 0 })
+})
+
+test('windowOf: an offset past the end clamps (the list shrank)', () => {
+  expect(windowOf(10, 30, 8)).toEqual({ start: 3, end: 10, above: 3, below: 0 })
+  expect(windowOf(0, 5, 8)).toEqual({ start: 0, end: 0, above: 0, below: 0 })
+  expect(windowOf(40, -4, 8)).toEqual({ start: 0, end: 7, above: 0, below: 33 })
+})
+
+test('windowOf: tiny rooms still show something', () => {
+  expect(windowOf(40, 0, 1)).toEqual({ start: 0, end: 1, above: 0, below: 0 }) // room < 3: rows only, no markers
+  expect(windowOf(40, 10, 2)).toEqual({ start: 10, end: 12, above: 0, below: 0 })
+  expect(windowOf(40, 39, 2)).toEqual({ start: 38, end: 40, above: 0, below: 0 }) // clamps to the last full window
+  expect(windowOf(40, 0, 0)).toEqual({ start: 0, end: 1, above: 0, below: 0 })
+})
+
+test('scrolled: wheel and pages clamp at both ends', () => {
+  expect(scrolled(0, -1, 40, 8)).toBe(0)
+  expect(scrolled(0, 8, 40, 8)).toBe(8)
+  expect(scrolled(30, 8, 40, 8)).toBe(33)
+})
+
+test('followed: brings a row into view with the least move', () => {
+  expect(followed(0, 3, 40, 8)).toBe(0) // already visible
+  expect(followed(0, 7, 40, 8)).toBe(2) // just below: becomes the last visible row of a middle window
+  expect(followed(20, 15, 40, 8)).toBe(15) // above: becomes the first row
+  expect(followed(0, 39, 40, 8)).toBe(33) // the last row: the end window
+})

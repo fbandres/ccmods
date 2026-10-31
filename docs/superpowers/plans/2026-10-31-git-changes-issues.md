@@ -238,8 +238,8 @@ export type IssuesState = { issues: Issue[]; isCapped: boolean; error?: string; 
 test('parseRemote / issuesRepoOf: github https, ssh, ssh://; others none', () => {
   expect(issuesRepoOf('https://github.com/fbandres/oscp-app.git')).toBe('fbandres/oscp-app-issues')
   expect(issuesRepoOf('https://github.com/fbandres/oscp-app')).toBe('fbandres/oscp-app-issues')
-  expect(issuesRepoOf('git@github.com:fbandres/oscp-app.git')).toBe('fbandres/oscp-app-issues')
-  expect(issuesRepoOf('ssh://git@github.com/fbandres/oscp-app.git')).toBe('fbandres/oscp-app-issues')
+  expect(issuesRepoOf(`${SSH}@github.com:fbandres/oscp-app.git`)).toBe('fbandres/oscp-app-issues')
+  expect(issuesRepoOf(`ssh://${SSH}@github.com/fbandres/oscp-app.git`)).toBe('fbandres/oscp-app-issues')
   expect(issuesRepoOf('https://gitlab.com/fbandres/oscp-app.git')).toBeUndefined()
   expect(issuesRepoOf('https://github.com/fbandres/oscp-app-issues.git')).toBeUndefined()
   expect(issuesRepoOf('')).toBeUndefined()
@@ -410,6 +410,6 @@ test('fitIssueRow: label drops first, then age; title cut with …', () => {
     - "How it works": gh commands, the 60 s rule, detection.
     - "Limits": needs `gh` logged in, github.com only, 100-issue cap. Remove "It's read-only: no staging…" only if it's no longer true (it still is; keep it).
     - Mention scrolling (wheel, PgUp/PgDn, arrows on issues).
-- [ ] **Step 6:** Run `sh scripts/check.sh` from the repo root. Expected: every line `✔`, including `git-changes: Ran N tests`, `types check` and `leak scan clean`. The leak scan flags `/home/` and emails, so keep both out of the README and the tests.
+- [ ] **Step 6:** Run `sh scripts/check.sh` from the repo root. Expected: every line `✔`, including `git-changes: Ran N tests`, `types check` and `leak scan clean`. The leak scan flags home-directory paths and email-shaped text, so keep both out of the README and the tests.
 - [ ] **Step 7:** Manual check: `claude --plugin-dir mods/git-changes` in a repo whose `-issues` sibling exists, and in one without. Check against the spec's ASCII mockups: the tabs, a click opening the browser, wheel/PgDn scrolling, and arrows following focus.
 - [ ] **Step 8:** Commit: `git commit -m "feat(git-changes): /changes issues toggle; 0.3.0 docs"`

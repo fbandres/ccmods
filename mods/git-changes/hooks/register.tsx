@@ -391,6 +391,35 @@ async function toggle($: Engine) {
   return { text: `Source Control pane ${willShow ? 'shown' : 'hidden'}.` }
 }
 
+/** `/changes issues`: the Issues tab off or on, remembered on this machine. */
+async function toggleIssues($: Engine) {
+  const isOn = (await $.store.get('issues')) === false
+  await $.store.set('issues', isOn)
+  if (!isOn) {
+    detection = { kind: 'off' }
+    tab = 'changes'
+    lastIssuesRaw = undefined
+    await update($, issues, () => null)
+    await update($, status, now => now && { ...now }) // draws without the tab bar
+    return { text: 'Issues tab hidden.' }
+  }
+  await detectIssues($)
+  await update($, status, now => now && { ...now })
+  const found: Detection = detection
+  if (found.kind === 'detected') return { text: 'Issues tab shown.' }
+  if (found.kind === 'retrying') return { text: 'Issues tab on; GitHub is unreachable right now, retrying every minute.' }
+  if (found.kind === 'none') return { text: `Issues tab on, but no issues repo was found: ${found.reason}.` }
+  return { text: 'Issues tab shown.' }
+}
+
+/** What `/changes <args>` does: no args toggles the pane, `issues` the Issues tab. */
+async function runCommand($: Engine, args: string) {
+  const word = args.trim().toLowerCase()
+  if (word === '') return toggle($)
+  if (word === 'issues') return toggleIssues($)
+  return { text: `Usage: /${commandName} [issues]` }
+}
+
 async function hide($: Engine) {
   stopTimers()
   await $.ui.close({ id: PANE })
@@ -408,8 +437,8 @@ export const register: Register = on => {
   })
 
   const failed = { text: 'git-changes: the pane could not be toggled; see the transcript.' }
-  on('command.run', { command: COMMAND }, $ => toggle($)).catch(() => failed)
-  on('command.run', { command: FALLBACK_COMMAND }, $ => toggle($)).catch(() => failed)
+  on('command.run', { command: COMMAND }, ($, e) => runCommand($, e.args)).catch(() => failed)
+  on('command.run', { command: FALLBACK_COMMAND }, ($, e) => runCommand($, e.args)).catch(() => failed)
 
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE && e.origin.kind !== 'plugin') {
@@ -468,9 +497,11 @@ export const register: Register = on => {
     const now = await read($, status)
     if (!now) return <Text dimColor>Reading git status…</Text>
 
+    // Read the issues every time: the read subscribes this pane, so a detection that lands later draws the tab bar.
+    const fetched = await read($, issues)
     const hasTabs = detection.kind === 'detected'
     if (!hasTabs) tab = 'changes'
-    const known = hasTabs ? await read($, issues) : null
+    const known = hasTabs ? fetched : null
     const width = Math.max(20, e.props.bodyColumns)
     const bodyRows = e.props.scroll.bodyRows
     const count = now.files.length

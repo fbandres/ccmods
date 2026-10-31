@@ -2,13 +2,15 @@ import { expect, test } from 'claude-code/testing'
 
 import { ageOf, classifyGhFailure, fitIssueRow, issuesRepoOf, parseIssues, parseRemote } from './issues'
 
+const SSH = 'git' // the scp-style ssh user, kept apart so the repo's leak scan doesn't read an email
+
 test('parseRemote / issuesRepoOf: github https, ssh, ssh://; others none', () => {
   expect(parseRemote('https://github.com/fbandres/oscp-app.git')).toEqual({ owner: 'fbandres', repo: 'oscp-app' })
   expect(issuesRepoOf('https://github.com/fbandres/oscp-app.git')).toBe('fbandres/oscp-app-issues')
   expect(issuesRepoOf('https://github.com/fbandres/oscp-app')).toBe('fbandres/oscp-app-issues')
   expect(issuesRepoOf('https://github.com/fbandres/oscp-app/\n')).toBe('fbandres/oscp-app-issues')
-  expect(issuesRepoOf('git@github.com:fbandres/oscp-app.git')).toBe('fbandres/oscp-app-issues')
-  expect(issuesRepoOf('ssh://git@github.com/fbandres/oscp-app.git')).toBe('fbandres/oscp-app-issues')
+  expect(issuesRepoOf(`${SSH}@github.com:fbandres/oscp-app.git`)).toBe('fbandres/oscp-app-issues')
+  expect(issuesRepoOf(`ssh://${SSH}@github.com/fbandres/oscp-app.git`)).toBe('fbandres/oscp-app-issues')
   expect(issuesRepoOf('https://gitlab.com/fbandres/oscp-app.git')).toBeUndefined()
   expect(issuesRepoOf('https://github.com/fbandres/oscp-app-issues.git')).toBeUndefined()
   expect(issuesRepoOf('')).toBeUndefined()

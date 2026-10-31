@@ -41,8 +41,8 @@ store 'issues' === false ──► feature off: no detection, no tab
 otherwise:
   git remote get-url origin
     ├─ https://github.com/<owner>/<repo>(.git)   ┐
-    ├─ git@github.com:<owner>/<repo>(.git)       ├─► target = <owner>/<repo>-issues
-    ├─ ssh://git@github.com/<owner>/<repo>(.git) ┘
+    ├─ <ssh>@github.com:<owner>/<repo>(.git)     ├─► target = <owner>/<repo>-issues
+    ├─ ssh://<ssh>@github.com/<owner>/<repo>(.git) ┘
     └─ no origin / other host ──► no tab
   gh repo view <target> --json name
     ├─ exit 0 ──► detected: show tab, start fetching

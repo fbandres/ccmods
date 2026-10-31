@@ -9,8 +9,8 @@ const GITHUB_REMOTE = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@
 
 /** The owner and repo of a github.com remote URL; nothing for any other host. */
 export function parseRemote(url: string): { owner: string; repo: string } | undefined {
-  const match = GITHUB_REMOTE.exec(url.trim())
-  return match ? { owner: match[1], repo: match[2] } : undefined
+  const [, owner, repo] = GITHUB_REMOTE.exec(url.trim()) ?? []
+  return owner && repo ? { owner, repo } : undefined
 }
 
 /** `owner/repo-issues` for a project's remote; nothing when it is not GitHub or already an issues repo. */

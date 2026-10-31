@@ -823,3 +823,110 @@ test('the more row under a long issue list opens the full list', async ($, on) =
   await settle()
   expect(opened(calls)).toEqual([['xdg-open', `https://github.com/${TARGET}/issues`]])
 })
+
+/** Runs `/changes <args>` (or the fallback name) and lets background work land. */
+async function runArgs($: Engine, args: string, command = 'changes') {
+  const answer = await $.command.run({ ...CHANGES, command, args })
+  await settle()
+  return answer
+}
+
+/** A store that remembers writes, readable by the test. */
+function fakeStore(on: On, entries: Record<string, unknown> = {}) {
+  const store: Record<string, unknown> = { ...entries }
+  on('store.get', async (_$, e) => ({ value: store[e.key] }))
+  on('store.set', async (_$, e) => {
+    store[e.key] = e.value
+    return { value: undefined }
+  })
+  return store
+}
+
+test('/changes issues hides the tab and remembers it, and shows it again', async ($, on) => {
+  const store = fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { list: issuesJson(2) } }))
+  await startSession($, on)
+  const pane = await mountPane($.ui, 'terminal')
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+
+  expect((await runArgs($, 'issues')).text).toBe('Issues tab hidden.')
+  expect(store.issues).toBe(false)
+  await pane.redraw()
+  expect(await pane.find({ key: 'tab-issues' })).toBeUndefined()
+  expect(await pane.find({ text: /^package\-lock\.json$/ })).toBeDefined()
+
+  expect((await runArgs($, 'issues')).text).toBe('Issues tab shown.')
+  expect(store.issues).toBe(true)
+  await pane.redraw()
+  expect(await pane.find({ key: 'tab-issues' })).toBeDefined()
+})
+
+for (const [why, git, reply] of [
+  ['a non-GitHub origin', { origin: 'https://gitlab.com/fbandres/oscp-app.git', gh: {} }, 'origin is not a GitHub repo'],
+  ['an unknown repo', { gh: { repo: 'missing' } }, `${TARGET} not found or no access`],
+  ['no gh', {}, 'gh is not installed'],
+  ['a logged-out gh', { gh: { loggedOut: true } }, 'gh is not logged in (run: gh auth login)'],
+] as const) {
+  test(`turning issues on with ${why} says why there is no tab`, async ($, on) => {
+    fakeStore(on, { issues: false })
+    mock.clock(on)
+    fakePanes(on)
+    fakeGit(on, () => git as Git)
+    await startSession($, on)
+
+    expect((await runArgs($, 'issues')).text).toBe(`Issues tab on, but no issues repo was found: ${reply}.`)
+  })
+}
+
+test('turning issues on while GitHub is down says it retries', async ($, on) => {
+  fakeStore(on, { issues: false })
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { repo: 'down' } }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'issues')).text).toBe('Issues tab on; GitHub is unreachable right now, retrying every minute.')
+})
+
+test('/changes ISSUES with spaces works; other arguments get the usage line', async ($, on) => {
+  fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: {} }))
+  await startSession($, on)
+
+  expect((await runArgs($, '  ISSUES ')).text).toBe('Issues tab hidden.')
+  expect((await runArgs($, 'foo')).text).toBe('Usage: /changes [issues]')
+})
+
+test('/git-changes issues works the same', async ($, on) => {
+  fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: {} }))
+  on('command.register', async (_$, e) =>
+    e.name === 'changes' ? { deny: 'a built-in has this name' } : { value: { command: e.name } },
+  )
+  await startSession($, on)
+
+  expect((await runArgs($, 'issues', 'git-changes')).text).toBe('Issues tab hidden.')
+  expect((await runArgs($, 'nope', 'git-changes')).text).toBe('Usage: /git-changes [issues]')
+})
+
+test('a pane drawn before detection finishes gains the tab bar when issues arrive', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gate = held()
+  fakeGit(on, () => ({ gh: { gate: gate.promise, list: issuesJson(4) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ key: 'tab-issues' })).toBeUndefined()
+  gate.release()
+  await settle()
+  expect(await pane.find({ text: /^ Issues 4 $/ })).toBeDefined()
+})

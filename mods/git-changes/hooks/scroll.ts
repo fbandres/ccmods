@@ -52,3 +52,18 @@ export function stepOf(by: number, bodyRows: number, room: number): number {
   if (Math.abs(by) < bodyRows) return by
   return Math.sign(by) * Math.max(1, room - 2)
 }
+
+/**
+ * The engine's focus ring only knows what is drawn: past the last shown row
+ * it lands on the first one or on a non-row (`next` < 0: the more row, a
+ * tab), and the same going up. With rows hidden beyond that edge the person
+ * meant to move on: `1` (down) or `-1` (up); anything else is `0`.
+ */
+export function wrapMove(previous: number, next: number, window: ListWindow): number {
+  const first = window.start
+  const last = window.end - 1
+  if (last <= first) return 0
+  if (previous === last && (next === first || next < 0) && window.below > 0) return 1
+  if (previous === first && (next === last || next < 0) && window.above > 0) return -1
+  return 0
+}

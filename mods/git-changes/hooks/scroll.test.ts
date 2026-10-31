@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { followed, scrolled, stepOf, windowOf } from './scroll'
+import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
 
 test('windowOf: everything fits, no markers', () => {
   expect(windowOf(5, 0, 8)).toEqual({ start: 0, end: 5, above: 0, below: 0 })
@@ -46,4 +46,16 @@ test('stepOf: wheel ticks pass through, engine pages become list pages', () => {
   expect(stepOf(-52, 52, 8)).toBe(-6)
   expect(stepOf(52, 52, 2)).toBe(1)
   expect(stepOf(0, 52, 8)).toBe(0)
+})
+
+test('wrapMove: the focus ring wrapping at an edge with rows beyond it is a one-row move', () => {
+  const middle = windowOf(40, 14, 8) // rows 14..19 show, rows hide above and below
+  expect(wrapMove(19, 14, middle)).toBe(1) // ↓ past the last shown row
+  expect(wrapMove(14, 19, middle)).toBe(-1) // ↑ past the first
+  expect(wrapMove(14, 15, middle)).toBe(0) // an ordinary step
+  expect(wrapMove(19, -1, middle)).toBe(1) // ↓ from the last row onto a non-row (the more row, a tab)
+  expect(wrapMove(14, -1, middle)).toBe(-1) // ↑ from the first row onto a tab
+  const end = windowOf(40, 33, 8) // nothing below
+  expect(wrapMove(39, 33, end)).toBe(0) // a real wrap: let it be
+  expect(wrapMove(-1, 33, end)).toBe(0) // first focus
 })

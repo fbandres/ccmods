@@ -4,7 +4,8 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { FileChange, IssuesState, RepoStatus } from '../types'
 import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
 import type { LineStat } from './status'
-import { scrolled, stepOf, windowOf } from './scroll'
+import { ageOf, fitIssueRow } from './issues'
+import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
 import type { Colors, ThemeEntry } from './theme'
 import { DEFAULT_THEMES, isRecord, isThemeNamed, MAX_INCLUDES, parseJsonc, pickBackground, stringsOf, THEME_SLUG, themeFile } from './theme'
@@ -21,6 +22,7 @@ const GIT_STATUS = ['git', '--no-optional-locks', 'status', '--porcelain=v2', '-
 const GIT_NUMSTAT = ['git', '--no-optional-locks', 'diff', '--numstat', '-z']
 const GIT_NUMSTAT_STAGED = ['git', '--no-optional-locks', 'diff', '--cached', '--numstat', '-z']
 const ISSUES_INTERVAL_MS = 60_000 // never poll GitHub faster
+const REFOCUS_MS = 60 // after a scroll, the newly drawn row takes the focus ring
 const MAX_COUNTED_FILES = 50
 const MAX_COUNTED_BYTES = 256 * 1024
 
@@ -41,6 +43,21 @@ let tab: Tab = 'changes'
 const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
 /** What the last drawing measured, for ui.scroll: the list's length, its rows of room, and its first body row. */
 const drawn = { length: 0, room: 1, top: 0, bodyRows: 1 }
+
+/** The issue row the ring was last on, as an index into the list; -1 for none. */
+let focusedIssue = -1
+
+/** Opens `url` in the browser: xdg-open (Linux), then open (macOS), else copies it. */
+async function openUrl($: Engine, url: string, surface: unknown) {
+  for (const opener of ['xdg-open', 'open']) {
+    try {
+      if ((await $.process.run([opener, url])).exitCode === 0) return
+    } catch {
+      // Not on this machine: try the next.
+    }
+  }
+  await $.ui.copy({ text: url, surface } as never).catch(() => {})
+}
 
 /** Rows left for a list (its markers included) under `pinnedRows` of header and footer. */
 function listRoom(bodyRows: number, pinnedRows: number) {
@@ -423,23 +440,141 @@ export const register: Register = on => {
     return {}
   }).catch(() => ({}))
 
+  // Arrows move the ring between drawn rows; past an edge with rows beyond it, the list follows.
+  on('ui.focus', { requestId: PANE }, async ($, e, next) => {
+    const number = /^issue-(\d+)$/.exec(e.element ?? '')?.[1]
+    if (tab !== 'issues') return next(e)
+    const items = (await read($, issues))?.issues ?? []
+    const index = number === undefined ? -1 : items.findIndex(issue => issue.number === Number(number))
+    const window = windowOf(items.length, offsets.issues, drawn.room)
+    const move = e.origin.kind === 'person' ? wrapMove(focusedIssue, index, window) : 0
+    if (move === 0) {
+      focusedIssue = index
+      return next(e)
+    }
+    const stay = items[focusedIssue]
+    const target = focusedIssue + move
+    offsets.issues = followed(offsets.issues, target, items.length, drawn.room)
+    focusedIssue = target
+    await update($, issues, now => now && { ...now }) // draws the new row
+    const key = `issue-${items[target].number}`
+    $.clock.after(REFOCUS_MS, () => void $.ui.focus({ requestId: PANE, key } as never).catch(() => {}))
+
+    return next({ ...e, element: `issue-${stay.number}` }) // the ring waits on the row it left
+  }).catch(($, e, next) => next(e))
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
     const now = await read($, status)
     if (!now) return <Text dimColor>Reading git status…</Text>
 
+    const hasTabs = detection.kind === 'detected'
+    if (!hasTabs) tab = 'changes'
+    const known = hasTabs ? await read($, issues) : null
     const width = Math.max(20, e.props.bodyColumns)
+    const bodyRows = e.props.scroll.bodyRows
     const count = now.files.length
     const isDirty = count > 0
-    const above = 2 + (isDirty ? 2 : 0) + (now.error ? 1 : 0) // branch, divider; totals, label; error
-    const room = listRoom(e.props.scroll.bodyRows, above + 2) // + divider, footer
-    const window = windowOf(count, offsets.changes, room)
-    offsets.changes = window.start // a list that shrank pulls the window back
-    Object.assign(drawn, { length: count, room, top: above, bodyRows: e.props.scroll.bodyRows })
-    const shown = now.files.slice(window.start, window.end)
+    const divider = <Text dimColor>{'─'.repeat(width)}</Text>
+    const timeOf = (at: number) => new Date(at).toTimeString().slice(0, 8)
+    const redraw = () => void update($, status, state => state && { ...state }).catch(() => {})
+
+    const branchRow = (
+      <Box justifyContent="space-between" gap={2}>
+        <Text wrap="truncate-end">
+          <Text bold>⎇ {now.isDetached ? `(${now.branch})` : now.branch}</Text>
+          {isDirty && <Text color="warning"> ●</Text>}
+        </Text>
+        {(now.ahead > 0 || now.behind > 0) && (
+          // A space after each triangle: fonts that draw it two columns wide never cover the count.
+          <Box gap={2} flexShrink={0}>
+            {now.ahead > 0 && <Text bold color="suggestion">{`▲ ${now.ahead}`}</Text>}
+            {now.behind > 0 && <Text bold color="warning">{`▼ ${now.behind}`}</Text>}
+          </Box>
+        )}
+      </Box>
+    )
+
+    const issuesCount = !known ? '…' : known.isCapped ? `${ISSUES_LIMIT}+` : String(known.issues.length)
+    const tabButton = (which: Tab, name: string, n: string, onPress: () => void) => (
+      <Button key={`tab-${which}`} plain onPress={onPress}>
+        {tab === which ? <Text bold>{`[${name} ${n}]`}</Text> : <Text dimColor>{` ${name} ${n} `}</Text>}
+      </Button>
+    )
+    const tabBar = hasTabs && (
+      <Box gap={1}>
+        {tabButton('changes', 'Changes', String(count), () => {
+          tab = 'changes'
+          redraw()
+        })}
+        {tabButton('issues', 'Issues', issuesCount, () => {
+          tab = 'issues'
+          redraw()
+          void fetchIssues($, true).catch(() => {})
+        })}
+      </Box>
+    )
+    const footer = (at: number) => (
+      <Text dimColor>
+        updated {timeOf(at)} · /{commandName}
+      </Text>
+    )
+
+    if (tab === 'issues' && detection.kind === 'detected') {
+      const items = known?.issues ?? []
+      const above = 3 + (known?.error ? 1 : 0) // branch, tabs, divider; error
+      const room = listRoom(bodyRows, above + 2) // + divider, footer
+      const window = windowOf(items.length, offsets.issues, room)
+      offsets.issues = window.start
+      Object.assign(drawn, { length: items.length, room, top: above, bodyRows })
+      const listUrl = `https://github.com/${detection.target}/issues`
+      const at = Date.now()
+
+      return (
+        <Box flexDirection="column">
+          {branchRow}
+          {tabBar}
+          {divider}
+          {known?.error && <Text color="error">{known.error}</Text>}
+          {known && items.length === 0 && (
+            <Box justifyContent="center">
+              <Text color="success">✔ No open issues</Text>
+            </Box>
+          )}
+          {window.above > 0 && <Text dimColor> ↑ {window.above} above</Text>}
+          {items.slice(window.start, window.end).map(issue => {
+            const row = fitIssueRow(issue, width, ageOf(issue.updatedAt, at))
+            const tail = row.label.length + (row.label && row.age ? 1 : 0) + row.age.length
+            const pad = ' '.repeat(Math.max(1, width - row.head.length - row.title.length - tail))
+            return (
+              <Button key={`issue-${issue.number}`} plain onPress={press => void openUrl($, issue.url, press.surface)}>
+                <Text>{`${row.head}${row.title}${pad}`}</Text>
+                {row.label && <Text dimColor>{row.label}</Text>}
+                {row.label && row.age ? ' ' : ''}
+                {row.age}
+              </Button>
+            )
+          })}
+          {window.below > 0 && (
+            <Button key="issues-more" plain dimColor onPress={press => void openUrl($, listUrl, press.surface)}>
+              {` ↓ ${window.below} more`}
+            </Button>
+          )}
+          {divider}
+          {footer(known?.updatedAt ?? now.updatedAt)}
+        </Box>
+      )
+    }
+
     const added = now.files.reduce((sum, file) => sum + (file.added ?? 0), 0)
     const removed = now.files.reduce((sum, file) => sum + (file.removed ?? 0), 0)
-    const divider = <Text dimColor>{'─'.repeat(width)}</Text>
+    const hasLabel = isDirty && !hasTabs // the tab says it when there are tabs
+    const above = 2 + (hasTabs ? 1 : 0) + (isDirty ? 1 : 0) + (hasLabel ? 1 : 0) + (now.error ? 1 : 0)
+    const room = listRoom(bodyRows, above + 2) // + divider, footer
+    const window = windowOf(count, offsets.changes, room)
+    offsets.changes = window.start // a list that shrank pulls the window back
+    Object.assign(drawn, { length: count, room, top: above, bodyRows })
+    const shown = now.files.slice(window.start, window.end)
 
     // Count columns line up across rows; dropped first when the pane is narrow.
     const plusWidth = Math.max(0, ...shown.map(file => (file.added ? `+${file.added}`.length : 0)))
@@ -449,19 +584,8 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Box justifyContent="space-between" gap={2}>
-          <Text wrap="truncate-end">
-            <Text bold>⎇ {now.isDetached ? `(${now.branch})` : now.branch}</Text>
-            {isDirty && <Text color="warning"> ●</Text>}
-          </Text>
-          {(now.ahead > 0 || now.behind > 0) && (
-            // A space after each triangle: fonts that draw it two columns wide never cover the count.
-            <Box gap={2} flexShrink={0}>
-              {now.ahead > 0 && <Text bold color="suggestion">{`▲ ${now.ahead}`}</Text>}
-              {now.behind > 0 && <Text bold color="warning">{`▼ ${now.behind}`}</Text>}
-            </Box>
-          )}
-        </Box>
+        {branchRow}
+        {tabBar}
         {isDirty && (
           <Box justifyContent="space-between">
             <Box gap={2}>
@@ -473,7 +597,7 @@ export const register: Register = on => {
         )}
         {divider}
         {now.error && <Text color="error">{now.error}</Text>}
-        {isDirty && (
+        {hasLabel && (
           <Box justifyContent="space-between">
             <Text dimColor bold>
               CHANGES
@@ -514,7 +638,7 @@ export const register: Register = on => {
         })}
         {window.below > 0 && <Text dimColor> ↓ {window.below} more</Text>}
         {divider}
-        <Text dimColor>updated {new Date(now.updatedAt).toTimeString().slice(0, 8)} · /{commandName}</Text>
+        {footer(now.updatedAt)}
       </Box>
     )
   })

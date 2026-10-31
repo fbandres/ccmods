@@ -50,6 +50,8 @@ type Git = {
   origin?: string | null
   /** The gh CLI; absent means gh is not installed. */
   gh?: Gh
+  /** The browser openers: ok (exit 0), fail (exit 1) or missing. Default xdg-open ok. */
+  opener?: { xdg?: 'ok' | 'fail' | 'missing'; open?: 'ok' | 'fail' | 'missing' }
   /** When set, `git status` waits for it before answering. */
   gate?: Promise<void>
   /** Untracked files' mtimes, by repo-relative path (default 0). */
@@ -109,6 +111,10 @@ function fakeGit(on: On, git: () => Git) {
     const now = git()
     calls.argv.push([...e.argv])
     if (e.argv[0] === 'gh') return answerGh(now.gh, e.argv)
+    if (e.argv[0] === 'xdg-open' || e.argv[0] === 'open') {
+      const how = (e.argv[0] === 'xdg-open' ? now.opener?.xdg : now.opener?.open) ?? (e.argv[0] === 'xdg-open' ? 'ok' : 'missing')
+      return how === 'missing' ? { deny: `${e.argv[0]}: not found` } : ran(how === 'ok' ? 0 : 1, '', '')
+    }
     if (e.argv[1] === 'remote') return now.origin === null ? ran(2, '', 'error: No such remote') : ran(0, `${now.origin ?? ORIGIN}\n`, '')
     if (e.argv[1] === 'rev-parse') {
       return now.isRepo === false ? ran(128, '', 'fatal: not a git repository') : ran(0, `${ROOT}\n`, '')
@@ -670,4 +676,150 @@ test('100 issues marks the list capped', async ($, on) => {
 
   await startSession($, on)
   expect(issues.value?.isCapped).toBe(true)
+})
+
+/** Records what the plugin copies to the clipboard. */
+function fakeCopy(on: On) {
+  const copied: string[] = []
+  on('ui.copy', async (_$, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true as const } }
+  })
+  return copied
+}
+
+const opened = (calls: { argv: string[][] }) => calls.argv.filter(argv => argv[0] === 'xdg-open' || argv[0] === 'open')
+
+test('no issues repo: no tab bar, the pane as before', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({}))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ key: 'tab-issues' })).toBeUndefined()
+  expect(await pane.find({ text: /CHANGES/ })).toBeDefined()
+})
+
+test('a detected issues repo shows the tab bar, on Changes', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { list: issuesJson(5) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /^\[Changes 2\]$/ })).toBeDefined()
+  expect(await pane.find({ text: /^ Issues 5 $/ })).toBeDefined()
+  expect(await pane.find({ text: /^package\-lock\.json$/ })).toBeDefined()
+})
+
+test('pressing the Issues tab fetches at once and lists the issues', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const calls = fakeGit(on, () => ({ gh: { list: issuesJson(3) } }))
+  await startSession($, on)
+  const before = ghRuns(calls, 'issue').length
+
+  const pane = await mountPane($.ui, 'terminal')
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+  await pane.redraw()
+  expect(ghRuns(calls, 'issue').length).toBe(before + 1)
+  expect(await pane.find({ text: /^\[Issues 3\]$/ })).toBeDefined()
+  expect(await pane.find({ text: /#3 / })).toBeDefined()
+  expect(await pane.find({ text: /Issue number 3/ })).toBeDefined()
+  expect(await pane.find({ text: /^bug$/ })).toBeDefined()
+  expect(await pane.find({ text: /^package\-lock\.json$/ })).toBeUndefined()
+})
+
+test('0 issues shows No open issues and never the repo name', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { list: '[]' } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /^ Issues 0 $/ })).toBeDefined()
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ text: /✔ No open issues/ })).toBeDefined()
+  expect(await pane.find({ text: /oscp-app-issues/ })).toBeUndefined()
+})
+
+test('100 issues reads Issues 100+', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { list: issuesJson(100) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /^ Issues 100\+ $/ })).toBeDefined()
+})
+
+for (const [name, opener, argv, isCopied] of [
+  ['xdg-open', { xdg: 'ok' }, [['xdg-open']], false],
+  ['open when xdg-open is missing', { xdg: 'missing', open: 'ok' }, [['xdg-open'], ['open']], false],
+  ['the clipboard when neither opens', { xdg: 'fail', open: 'fail' }, [['xdg-open'], ['open']], true],
+] as const) {
+  test(`pressing an issue opens it with ${name}`, async ($, on) => {
+    mock.store(on)
+    mock.clock(on)
+    fakePanes(on)
+    const copied = fakeCopy(on)
+    const calls = fakeGit(on, () => ({ gh: { list: issuesJson(3) }, opener }))
+    await startSession($, on)
+
+    const pane = await mountPane($.ui, 'terminal')
+    await pane.press({ key: 'tab-issues' })
+    await settle()
+    await pane.redraw()
+    await pane.press({ key: 'issue-2' })
+    await settle()
+    const url = `https://github.com/${TARGET}/issues/2`
+    expect(opened(calls)).toEqual(argv.map(([cmd]) => [cmd, url]))
+    expect(copied).toEqual(isCopied ? [url] : [])
+  })
+}
+
+test('the issues error shows in the Issues tab only', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  let gh: Gh = { list: issuesJson(2) }
+  fakeGit(on, () => ({ gh }))
+  await startSession($, on)
+  gh = { listError: 'HTTP 502: Bad Gateway' }
+  await clock.advance(60_000)
+  await settle()
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /GitHub: HTTP 502/ })).toBeUndefined()
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ text: /GitHub: HTTP 502/ })).toBeDefined()
+  expect(await pane.find({ text: /Issue number 2/ })).toBeDefined()
+})
+
+test('the more row under a long issue list opens the full list', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const calls = fakeGit(on, () => ({ gh: { list: issuesJson(30) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal', 12)
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ text: /↓ \d+ more/ })).toBeDefined()
+  await pane.press({ key: 'issues-more' })
+  await settle()
+  expect(opened(calls)).toEqual([['xdg-open', `https://github.com/${TARGET}/issues`]])
 })

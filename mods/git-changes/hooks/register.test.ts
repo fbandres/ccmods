@@ -3,6 +3,8 @@ import type { Engine, EngineMount } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
 import type { IssuesState } from '../types'
 
+declare function setTimeout(fn: (value?: unknown) => void, ms: number): unknown // the test runtime has it; the mod's lib does not declare it
+
 const PLUGIN = 'git-changes'
 const CLEAN_HEAD = '# branch.oid 1a2b3c4d5e6f\0# branch.head main\0'
 const DIRTY =

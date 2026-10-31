@@ -35,7 +35,7 @@ test('parseIssues: first label, flattened titles, no labels', () => {
     updatedAt: '2026-10-31T10:00:00Z',
     url: 'https://github.com/o/r-issues/issues/42',
   })
-  expect(b.label).toBeUndefined()
+  expect(b?.label).toBeUndefined()
   expect(() => parseIssues('nope')).toThrow()
 })
 

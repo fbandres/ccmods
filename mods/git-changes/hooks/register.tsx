@@ -298,7 +298,7 @@ async function issuesTick($: Engine) {
 }
 
 function firstLine(text: string) {
-  return text.split('\n')[0].trim()
+  return (text.split('\n')[0] ?? '').trim()
 }
 
 /** Bumped by every detection and by turning issues off: a slower, older detection then drops its answer. */
@@ -506,6 +506,7 @@ export const register: Register = on => {
     }
     const stay = items[previous]
     const target = items[previous + move]
+    if (!stay || !target) return next(e)
     offsets.issues = followed(offsets.issues, previous + move, items.length, drawn.room)
     focusedIssue = target.number
     await update($, issues, now => now && { ...now }) // draws the new row

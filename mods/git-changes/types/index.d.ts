@@ -17,8 +17,17 @@ export type RepoStatus = {
   updatedAt: number
 }
 
+export type Issue = { number: number; title: string; label?: string; updatedAt: string; url: string }
+export type IssuesState = {
+  issues: Issue[]
+  /** True when gh returned the limit: there may be more. */
+  isCapped: boolean
+  error?: string
+  updatedAt: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'git-changes': { status: RepoStatus | null }
+    'git-changes': { status: RepoStatus | null; issues: IssuesState | null }
   }
 }

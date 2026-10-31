@@ -1,0 +1,83 @@
+import type { Issue } from '../types'
+
+/** `gh issue list --limit`: more than this reads `100+`. */
+export const ISSUES_LIMIT = 100
+const LABEL_COLUMNS = 10
+const MIN_TITLE = 12
+
+const GITHUB_REMOTE = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/
+
+/** The owner and repo of a github.com remote URL; nothing for any other host. */
+export function parseRemote(url: string): { owner: string; repo: string } | undefined {
+  const match = GITHUB_REMOTE.exec(url.trim())
+  return match ? { owner: match[1], repo: match[2] } : undefined
+}
+
+/** `owner/repo-issues` for a project's remote; nothing when it is not GitHub or already an issues repo. */
+export function issuesRepoOf(url: string): string | undefined {
+  const remote = parseRemote(url)
+  if (!remote || remote.repo.endsWith('-issues')) return undefined
+  return `${remote.owner}/${remote.repo}-issues`
+}
+
+/** `gh issue list --json number,title,labels,updatedAt,url` output. Throws on anything but JSON. */
+export function parseIssues(json: string): Issue[] {
+  const raw = JSON.parse(json) as Array<{ number: number; title: string; labels?: Array<{ name: string }>; updatedAt: string; url: string }>
+  return raw.map(item => {
+    const label = item.labels?.[0]?.name
+    return {
+      number: item.number,
+      // Control characters (newlines, NUL) would break the one-line row.
+      title: item.title.replace(/[\u0000-\u001f\u007f\s]+/g, ' ').trim(),
+      ...(label ? { label } : {}),
+      updatedAt: item.updatedAt,
+      url: item.url,
+    }
+  })
+}
+
+export type GhFailure = 'logged-out' | 'not-found' | 'temporary'
+
+/** Why a gh call failed, from its stderr: only logged-out and not-found are final. */
+export function classifyGhFailure(stderr: string): GhFailure {
+  if (/gh auth login|not logged in|authentication/i.test(stderr)) return 'logged-out'
+  if (/Could not resolve to a Repository|HTTP 404|Not Found/.test(stderr)) return 'not-found'
+  return 'temporary'
+}
+
+/** How long ago `iso` was, short: `now`, `5m`, `2h`, `3d`, `2w`, `4mo`, `1y`. Blank when unreadable. */
+export function ageOf(iso: string, now: number): string {
+  const at = Date.parse(iso)
+  if (Number.isNaN(at)) return ''
+  const minutes = Math.floor(Math.max(0, now - at) / 60_000)
+  if (minutes < 1) return 'now'
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  const days = Math.floor(hours / 24)
+  if (days < 7) return `${days}d`
+  if (days < 30) return `${Math.floor(days / 7)}w`
+  if (days < 365) return `${Math.floor(days / 30)}mo`
+  return `${Math.floor(days / 365)}y`
+}
+
+function cut(text: string, width: number) {
+  if (text.length <= width) return text
+  return width > 1 ? `${text.slice(0, width - 1)}…` : text.slice(0, Math.max(0, width))
+}
+
+/**
+ * An issue row fitted to `width` columns: `#N `, the title, then the label
+ * and the age, each after a space. The label drops first, then the age, so
+ * the title keeps at least 12 columns; the title is cut with `…`.
+ */
+export function fitIssueRow(issue: Issue, width: number, age: string) {
+  const head = `#${issue.number} `
+  let label = issue.label ? cut(issue.label, LABEL_COLUMNS) : ''
+  let shownAge = age
+  const tail = () => (label ? label.length + 1 : 0) + (shownAge ? shownAge.length + 1 : 0)
+  if (label && head.length + MIN_TITLE + tail() > width) label = ''
+  if (shownAge && head.length + MIN_TITLE + tail() > width) shownAge = ''
+
+  return { head, title: cut(issue.title, width - head.length - tail()), label, age: shownAge }
+}

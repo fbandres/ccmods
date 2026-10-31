@@ -16,8 +16,15 @@ const CHANGES = {
   presentation: { isFullscreen: false, columns: 120 },
 } as const
 
-/** Runs `/changes` as the person typing it does. */
-const runChanges = ($: Engine) => $.command.run(CHANGES)
+/** Lets fire-and-forget work (the refresh after opening) finish. */
+const settle = () => new Promise(resolve => setTimeout(resolve, 30))
+
+/** Runs `/changes` as the person typing it does, then lets the git read land. */
+async function runChanges($: Engine) {
+  const answer = await $.command.run(CHANGES)
+  await settle()
+  return answer
+}
 
 /** An op hook's answer: the process result as `{ value }`. */
 const ran = (exitCode: number, stdout: string, stderr: string) => ({
@@ -38,6 +45,8 @@ type Git = {
   staged?: string
   /** Untracked files' contents, by repo-relative path. */
   files?: Record<string, string>
+  /** When set, `git status` waits for it before answering. */
+  gate?: Promise<void>
   /** Untracked files' mtimes, by repo-relative path (default 0). */
   mtimes?: Record<string, number>
 }
@@ -60,6 +69,7 @@ function fakeGit(on: On, git: () => Git) {
       return ran(0, (isStaged ? now.staged : now.unstaged) ?? (isDefault && !isStaged ? DIRTY_UNSTAGED : ''), '')
     }
     calls.status++
+    if (now.gate) await now.gate
     return ran(now.exitCode ?? 0, now.stdout ?? DIRTY, now.stderr ?? '')
   })
   const fileOf = (path: string) => {
@@ -400,4 +410,64 @@ test('untracked files are read once while their size and mtime hold', async ($, 
   git = { stdout: SIX_FILES, files, mtimes: { 'c.ts': 5 } }
   await clock.advance(2000)
   expect(calls.reads).toBe(7)
+})
+
+/** A promise and the function that resolves it. */
+function held() {
+  let release = () => {}
+  const promise = new Promise<void>(resolve => (release = resolve))
+  return { promise, release }
+}
+
+test('/changes opens the pane before git answers', async ($, on) => {
+  mock.store(on, { shown: false })
+  mock.clock(on)
+  const panes = fakePanes(on)
+  const gate = held()
+  fakeGit(on, () => ({ gate: gate.promise }))
+
+  const running = $.command.run(CHANGES)
+  for (let waited = 0; !panes.isOpen && waited < 2000; waited += 20) await new Promise(r => setTimeout(r, 20))
+  expect(panes.isOpen).toBe(true)
+  gate.release()
+  await running
+})
+
+test('the footer names /git-changes when /changes was refused', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({}))
+  on('command.register', async (_$, e) => {
+    if (e.name === 'changes') return { deny: 'a built-in has this name' }
+    return { value: { command: e.name } }
+  })
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await settle()
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /· \/git-changes$/ })).toBeDefined()
+})
+
+test('a refresh asked during a refresh runs once more afterwards', async ($, on) => {
+  mock.store(on, { shown: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  let git: Git = {}
+  const calls = fakeGit(on, () => git)
+  await runChanges($)
+  await settle()
+
+  const gate = held()
+  git = { gate: gate.promise }
+  const before = calls.status
+  await clock.advance(2000) // starts a refresh that waits on git
+  await settle()
+  await clock.advance(2000) // asked while it runs
+  await clock.advance(2000) // asked again: still only one queued
+  git = {}
+  gate.release()
+  await settle()
+  expect(calls.status).toBe(before + 2)
 })

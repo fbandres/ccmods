@@ -25,6 +25,8 @@ const status = atom({ plugin: 'git-changes', key: 'status' } as const, null as R
 
 let timer: { cancel: () => void } | undefined
 let isChecking = false
+let pendingRefresh = false // asked while a refresh ran: run once more after it
+let commandName = COMMAND // the name registerCommand actually got
 let lastRaw: string | undefined
 let root = ''
 /** New files' line counts, kept while their size and mtime hold. */
@@ -86,8 +88,11 @@ function numstatOf(run: { exitCode: number; stdout: string }) {
   return run.exitCode === 0 ? run.stdout : ''
 }
 
-async function refresh($: Engine) {
-  if (isChecking) return
+async function refresh($: Engine): Promise<void> {
+  if (isChecking) {
+    pendingRefresh = true
+    return
+  }
   isChecking = true
   try {
     const [run, unstagedRun, stagedRun] = await Promise.all([
@@ -116,6 +121,10 @@ async function refresh($: Engine) {
     await showError($, 'git status failed: git could not be started')
   } finally {
     isChecking = false
+    if (pendingRefresh) {
+      pendingRefresh = false
+      void refresh($).catch(() => {})
+    }
   }
 }
 
@@ -216,9 +225,11 @@ async function tick($: Engine) {
 async function registerCommand($: Engine) {
   try {
     await $.command.register({ name: COMMAND, description: DESCRIPTION })
+    commandName = COMMAND
   } catch {
     try {
       await $.command.register({ name: FALLBACK_COMMAND, description: DESCRIPTION })
+      commandName = FALLBACK_COMMAND
     } catch {
       // No command at all: the pane still opens from the stored state.
     }
@@ -233,8 +244,8 @@ function startTimer($: Engine) {
 async function show($: Engine) {
   startTimer($)
   lastRaw = undefined // reopening always redraws from a fresh read
-  await refresh($)
   await $.ui.open({ id: PANE, title: TITLE, columns: DOCK_COLUMNS })
+  void refresh($).catch(() => {}) // open first: a slow repo never holds the command
 }
 
 /** On start: open at once, read git after, so a slow repo never holds the session. */
@@ -378,7 +389,7 @@ export const register: Register = on => {
         })}
         {hiddenCount > 0 && <Text dimColor> … {hiddenCount} more</Text>}
         {divider}
-        <Text dimColor>updated {new Date(now.updatedAt).toTimeString().slice(0, 8)} · /changes to hide</Text>
+        <Text dimColor>updated {new Date(now.updatedAt).toTimeString().slice(0, 8)} · /{commandName}</Text>
       </Box>
     )
   })

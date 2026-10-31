@@ -1,6 +1,7 @@
 import type { On } from 'claude-code'
 import type { Engine, EngineMount } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
+import type { IssuesState } from '../types'
 
 const PLUGIN = 'git-changes'
 const CLEAN_HEAD = '# branch.oid 1a2b3c4d5e6f\0# branch.head main\0'
@@ -45,10 +46,57 @@ type Git = {
   staged?: string
   /** Untracked files' contents, by repo-relative path. */
   files?: Record<string, string>
+  /** `git remote get-url origin`; null for no origin. Default: a github.com remote. */
+  origin?: string | null
+  /** The gh CLI; absent means gh is not installed. */
+  gh?: Gh
   /** When set, `git status` waits for it before answering. */
   gate?: Promise<void>
   /** Untracked files' mtimes, by repo-relative path (default 0). */
   mtimes?: Record<string, number>
+}
+
+type Gh = {
+  loggedOut?: boolean
+  /** `gh repo view`: found, missing (not found), or down (network). Default found. */
+  repo?: 'found' | 'missing' | 'down'
+  /** When set, `gh repo view` waits for it before answering. */
+  gate?: Promise<void>
+  /** `gh issue list` JSON; default `[]`. */
+  list?: string
+  listError?: string
+}
+
+const ORIGIN = 'https://github.com/fbandres/oscp-app.git'
+const TARGET = 'fbandres/oscp-app-issues'
+
+/** `count` issues as gh prints them, newest number first. */
+function issuesJson(count: number, labels = ['bug']) {
+  return JSON.stringify(
+    Array.from({ length: count }, (_, i) => ({
+      number: count - i,
+      title: `Issue number ${count - i}`,
+      labels: labels.map(name => ({ name })),
+      updatedAt: '2026-10-31T10:00:00Z',
+      url: `https://github.com/${TARGET}/issues/${count - i}`,
+    })),
+  )
+}
+
+/** Answers gh's calls from `gh`; rejects as a missing binary does when absent. */
+async function answerGh(gh: Gh | undefined, argv: readonly string[]) {
+  if (!gh) return { deny: 'gh: command not found' }
+  const loggedOutText = 'To get started with GitHub CLI, please run:  gh auth login'
+  if (argv[1] === 'auth') return gh.loggedOut ? ran(1, '', 'You are not logged into any GitHub hosts. To log in, run: gh auth login') : ran(0, '', '')
+  if (argv[1] === 'repo') {
+    if (gh.gate) await gh.gate
+    if (gh.loggedOut) return ran(4, '', loggedOutText)
+    if (gh.repo === 'missing') return ran(1, '', `GraphQL: Could not resolve to a Repository with the name '${argv[3]}'. (repository)`)
+    if (gh.repo === 'down') return ran(1, '', 'error connecting to api.github.com')
+    return ran(0, '{"name":"oscp-app-issues"}', '')
+  }
+  if (argv[1] === 'issue') return gh.listError ? ran(1, '', gh.listError) : ran(0, gh.list ?? '[]', '')
+  return ran(1, '', 'unknown gh command')
 }
 
 /**
@@ -60,6 +108,8 @@ function fakeGit(on: On, git: () => Git) {
   on('process.run', async (_$, e) => {
     const now = git()
     calls.argv.push([...e.argv])
+    if (e.argv[0] === 'gh') return answerGh(now.gh, e.argv)
+    if (e.argv[1] === 'remote') return now.origin === null ? ran(2, '', 'error: No such remote') : ran(0, `${now.origin ?? ORIGIN}\n`, '')
     if (e.argv[1] === 'rev-parse') {
       return now.isRepo === false ? ran(128, '', 'fatal: not a git repository') : ran(0, `${ROOT}\n`, '')
     }
@@ -470,4 +520,153 @@ test('a refresh asked during a refresh runs once more afterwards', async ($, on)
   gate.release()
   await settle()
   expect(calls.status).toBe(before + 2)
+})
+
+/** The issues value the plugin last wrote, as its `state.set` carries it. */
+function watchIssues(on: On) {
+  const seen = { value: null as IssuesState | null }
+  on('state.set', async (_$, e, next) => {
+    if ((e as { key?: string }).key === 'issues') seen.value = (e as { value: IssuesState | null }).value
+    return next(e)
+  })
+  return seen
+}
+const ghRuns = (calls: { argv: string[][] }, sub: string) => calls.argv.filter(argv => argv[0] === 'gh' && argv[1] === sub)
+
+/** Starts a session the way Claude Code does, the pane shown by default. */
+async function startSession($: Engine, on: On) {
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await settle()
+}
+
+test('issues are fetched after start without delaying the pane', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  const panes = fakePanes(on)
+  const issues = watchIssues(on)
+  const gate = held()
+  const calls = fakeGit(on, () => ({ gh: { gate: gate.promise, list: issuesJson(3) } }))
+
+  await startSession($, on)
+  expect(panes.isOpen).toBe(true)
+  expect(calls.status).toBeGreaterThan(0)
+  expect(ghRuns(calls, 'issue')).toHaveLength(0)
+
+  gate.release()
+  await settle()
+  expect(ghRuns(calls, 'repo')[0]).toEqual(['gh', 'repo', 'view', TARGET, '--json', 'name'])
+  expect(ghRuns(calls, 'issue')[0]).toEqual([
+    'gh', 'issue', 'list', '-R', TARGET, '--state', 'open', '--search', 'sort:updated-desc', '--limit', '100',
+    '--json', 'number,title,labels,updatedAt,url',
+  ])
+  expect(issues.value?.issues.map(issue => issue.number)).toEqual([3, 2, 1])
+})
+
+for (const [name, git] of [
+  ['a non-GitHub origin', { origin: 'https://gitlab.com/fbandres/oscp-app.git', gh: {} }],
+  ['no origin', { origin: null, gh: {} }],
+  ['a missing gh', {}],
+  ['a logged-out gh', { gh: { loggedOut: true } }],
+  ['an unknown issues repo', { gh: { repo: 'missing' } }],
+] as const) {
+  test(`${name} never fetches issues`, async ($, on) => {
+    mock.store(on)
+    const clock = mock.clock(on)
+    fakePanes(on)
+    const issues = watchIssues(on)
+    const calls = fakeGit(on, () => git as Git)
+
+    await startSession($, on)
+    await clock.advance(60_000)
+    await settle()
+    expect(ghRuns(calls, 'issue')).toHaveLength(0)
+    expect(issues.value).toBeNull()
+  })
+}
+
+test('a GitHub outage at start retries on the 60s tick', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const issues = watchIssues(on)
+  let gh: Gh = { repo: 'down' }
+  const calls = fakeGit(on, () => ({ gh }))
+
+  await startSession($, on)
+  expect(ghRuns(calls, 'issue')).toHaveLength(0)
+
+  gh = { list: issuesJson(2) }
+  await clock.advance(60_000)
+  await settle()
+  expect(ghRuns(calls, 'issue')).toHaveLength(1)
+  expect(issues.value?.issues).toHaveLength(2)
+})
+
+test('issues refresh every 60s only while placed', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  const placed = fakePanes(on)
+  const issues = watchIssues(on)
+  const calls = fakeGit(on, () => ({ gh: {} }))
+
+  await startSession($, on)
+  expect(ghRuns(calls, 'issue')).toHaveLength(1)
+  await clock.advance(30_000)
+  await settle()
+  expect(ghRuns(calls, 'issue')).toHaveLength(1)
+  await clock.advance(30_000)
+  await settle()
+  expect(ghRuns(calls, 'issue')).toHaveLength(2)
+
+  placed.value = false
+  await clock.advance(120_000)
+  await settle()
+  expect(ghRuns(calls, 'issue')).toHaveLength(2)
+})
+
+test('store issues=false skips detection entirely', async ($, on) => {
+  mock.store(on, { issues: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const issues = watchIssues(on)
+  const calls = fakeGit(on, () => ({ gh: {} }))
+
+  await startSession($, on)
+  await clock.advance(60_000)
+  await settle()
+  expect(calls.argv.filter(argv => argv[0] === 'gh')).toHaveLength(0)
+})
+
+test('a fetch failure keeps the last list and sets the error', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const issues = watchIssues(on)
+  let gh: Gh = { list: issuesJson(2) }
+  fakeGit(on, () => ({ gh }))
+
+  await startSession($, on)
+  gh = { listError: 'HTTP 502: Bad Gateway\nmore' }
+  await clock.advance(60_000)
+  await settle()
+  const now = issues.value
+  expect(now?.issues).toHaveLength(2)
+  expect(now?.error).toBe('GitHub: HTTP 502: Bad Gateway')
+
+  gh = { list: issuesJson(2) }
+  await clock.advance(60_000)
+  await settle()
+  expect(issues.value?.error).toBeUndefined()
+})
+
+test('100 issues marks the list capped', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const issues = watchIssues(on)
+  fakeGit(on, () => ({ gh: { list: issuesJson(100) } }))
+
+  await startSession($, on)
+  expect(issues.value?.isCapped).toBe(true)
 })

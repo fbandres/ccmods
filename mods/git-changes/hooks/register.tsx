@@ -1,7 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register } from 'claude-code'
 
-import type { FileChange, RepoStatus } from '../types'
+import type { FileChange, IssuesState, RepoStatus } from '../types'
+import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
 import type { LineStat } from './status'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
 import type { Colors, ThemeEntry } from './theme'
@@ -18,10 +19,20 @@ const DESCRIPTION = 'Show or hide the Source Control pane of changed files'
 const GIT_STATUS = ['git', '--no-optional-locks', 'status', '--porcelain=v2', '-b', '-z', '-uall']
 const GIT_NUMSTAT = ['git', '--no-optional-locks', 'diff', '--numstat', '-z']
 const GIT_NUMSTAT_STAGED = ['git', '--no-optional-locks', 'diff', '--cached', '--numstat', '-z']
+const ISSUES_INTERVAL_MS = 60_000 // never poll GitHub faster
 const MAX_COUNTED_FILES = 50
 const MAX_COUNTED_BYTES = 256 * 1024
 
 const status = atom({ plugin: 'git-changes', key: 'status' } as const, null as RepoStatus | null)
+const issues = atom({ plugin: 'git-changes', key: 'issues' } as const, null as IssuesState | null)
+
+/** Where the `<repo>-issues` lookup stands: `none` and `off` are final for the session, `retrying` is not. */
+type Detection = { kind: 'off' } | { kind: 'none'; reason: string } | { kind: 'retrying' } | { kind: 'detected'; target: string }
+let detection: Detection = { kind: 'off' }
+let issuesTimer: { cancel: () => void } | undefined
+let isFetching = false
+let fetchQueued = false // a tab press asked while a fetch ran: fetch once more after it
+let lastIssuesRaw: string | undefined
 
 let timer: { cancel: () => void } | undefined
 let isChecking = false
@@ -239,6 +250,91 @@ async function registerCommand($: Engine) {
 function startTimer($: Engine) {
   timer?.cancel()
   timer = $.clock.every(INTERVAL_MS, () => void tick($))
+  issuesTimer?.cancel()
+  issuesTimer = $.clock.every(ISSUES_INTERVAL_MS, () => void issuesTick($).catch(() => {}))
+}
+
+function stopTimers() {
+  timer?.cancel()
+  timer = undefined
+  issuesTimer?.cancel()
+  issuesTimer = undefined
+}
+
+async function issuesTick($: Engine) {
+  if (!(await isPlaced($))) return
+  if (detection.kind === 'retrying') await detectIssues($)
+  else if (detection.kind === 'detected') await fetchIssues($)
+}
+
+function firstLine(text: string) {
+  return text.split('\n')[0].trim()
+}
+
+/** Finds `<owner>/<repo>-issues` from origin; on success fetches at once (not awaited). */
+async function detectIssues($: Engine) {
+  if ((await $.store.get('issues')) === false) {
+    detection = { kind: 'off' }
+    return
+  }
+  const origin = await $.process.run(['git', 'remote', 'get-url', 'origin']).catch(() => undefined)
+  const target = origin?.exitCode === 0 ? issuesRepoOf(origin.stdout) : undefined
+  if (!target) {
+    detection = { kind: 'none', reason: 'origin is not a GitHub repo' }
+    return
+  }
+  let view: { exitCode: number; stderr: string }
+  try {
+    view = await $.process.run(['gh', 'repo', 'view', target, '--json', 'name'])
+  } catch {
+    detection = { kind: 'none', reason: 'gh is not installed' }
+    return
+  }
+  if (view.exitCode === 0) {
+    detection = { kind: 'detected', target }
+    void fetchIssues($).catch(() => {})
+    return
+  }
+  const auth = await $.process.run(['gh', 'auth', 'status']).catch(() => undefined)
+  if (!auth || auth.exitCode !== 0) detection = { kind: 'none', reason: 'gh is not logged in (run: gh auth login)' }
+  else if (classifyGhFailure(view.stderr) === 'not-found') detection = { kind: 'none', reason: `${target} not found or no access` }
+  else detection = { kind: 'retrying' }
+}
+
+/** Reads the open issues; a failure keeps the last list and sets `error`. */
+async function fetchIssues($: Engine, isUrgent = false): Promise<void> {
+  if (detection.kind !== 'detected') return
+  if (isFetching) {
+    if (isUrgent) fetchQueued = true
+    return
+  }
+  isFetching = true
+  const failed = (error: string) =>
+    update($, issues, now => ({ ...(now ?? { issues: [], isCapped: false, updatedAt: Date.now() }), error }))
+  try {
+    const run = await $.process.run([
+      'gh', 'issue', 'list', '-R', detection.target, '--state', 'open', '--search', 'sort:updated-desc',
+      '--limit', String(ISSUES_LIMIT), '--json', 'number,title,labels,updatedAt,url',
+    ])
+    if (run.exitCode !== 0) {
+      lastIssuesRaw = undefined
+      await failed(`GitHub: ${firstLine(run.stderr)}`)
+      return
+    }
+    if (run.stdout === lastIssuesRaw && (await read($, issues)) !== null) return
+    const list = parseIssues(run.stdout)
+    lastIssuesRaw = run.stdout
+    await update($, issues, () => ({ issues: list, isCapped: list.length >= ISSUES_LIMIT, updatedAt: Date.now() }))
+  } catch {
+    lastIssuesRaw = undefined
+    await failed('GitHub: gh could not be run')
+  } finally {
+    isFetching = false
+    if (fetchQueued) {
+      fetchQueued = false
+      void fetchIssues($).catch(() => {})
+    }
+  }
 }
 
 async function show($: Engine) {
@@ -266,15 +362,16 @@ async function toggle($: Engine) {
 }
 
 async function hide($: Engine) {
-  timer?.cancel()
-  timer = undefined
+  stopTimers()
   await $.ui.close({ id: PANE })
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await registerCommand($)
-    if ((await $.store.get('shown')) !== false && (await isRepo($))) await showOnStart($)
+    const isGit = await isRepo($)
+    if (isGit && (await $.store.get('shown')) !== false) await showOnStart($)
+    if (isGit) void detectIssues($).catch(() => {}) // GitHub never holds the session
     void syncEditorTheme($).catch(() => {}) // the pane's fill follows the editor; never holds the session
 
     return next(e)
@@ -286,8 +383,7 @@ export const register: Register = on => {
 
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE && e.origin.kind !== 'plugin') {
-      timer?.cancel()
-      timer = undefined
+      stopTimers()
       if (e.origin.kind === 'person') await $.store.set('shown', false)
     }
 

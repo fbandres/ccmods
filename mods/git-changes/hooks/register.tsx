@@ -27,6 +27,8 @@ let timer: { cancel: () => void } | undefined
 let isChecking = false
 let lastRaw: string | undefined
 let root = ''
+/** New files' line counts, kept while their size and mtime hold. */
+const untrackedCache = new Map<string, { size: number; mtimeMs: number; stat: LineStat }>()
 
 function isShown() {
   return timer !== undefined
@@ -59,12 +61,22 @@ async function untrackedStats($: Engine, files: readonly FileChange[]) {
     try {
       const stat = await $.fs.stat(path)
       if (stat.kind !== 'file' || stat.size > MAX_COUNTED_BYTES) continue
+      const cached = untrackedCache.get(file.path)
+      if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+        stats.set(file.path, cached.stat)
+        continue
+      }
       const text = await $.fs.read(path)
-      if (typeof text === 'string') stats.set(file.path, countLines(text))
+      if (typeof text !== 'string') continue
+      const counted = countLines(text)
+      untrackedCache.set(file.path, { size: stat.size, mtimeMs: stat.mtimeMs, stat: counted })
+      stats.set(file.path, counted)
     } catch {
       // Gone or unreadable since git listed it: the row shows no counts.
     }
   }
+  const listed = new Set(untracked.map(file => file.path))
+  for (const path of untrackedCache.keys()) if (!listed.has(path)) untrackedCache.delete(path)
 
   return stats
 }

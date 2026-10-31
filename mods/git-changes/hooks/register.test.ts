@@ -38,6 +38,8 @@ type Git = {
   staged?: string
   /** Untracked files' contents, by repo-relative path. */
   files?: Record<string, string>
+  /** Untracked files' mtimes, by repo-relative path (default 0). */
+  mtimes?: Record<string, number>
 }
 
 /**
@@ -45,7 +47,7 @@ type Git = {
  * `git status` runs; `argv` holds every git argv seen.
  */
 function fakeGit(on: On, git: () => Git) {
-  const calls = { status: 0, argv: [] as string[][] }
+  const calls = { status: 0, reads: 0, argv: [] as string[][] }
   on('process.run', async (_$, e) => {
     const now = git()
     calls.argv.push([...e.argv])
@@ -69,10 +71,11 @@ function fakeGit(on: On, git: () => Git) {
     const text = fileOf(e.path)
     return text === undefined
       ? { deny: 'no such file' }
-      : { value: { kind: 'file' as const, size: text.length, mtimeMs: 0, isLink: false } }
+      : { value: { kind: 'file' as const, size: text.length, mtimeMs: git().mtimes?.[e.path.replace(`${ROOT}/`, '')] ?? 0, isLink: false } }
   })
   on('fs.read', async (_$, e) => {
     const text = fileOf(e.path)
+    calls.reads++
     return text === undefined ? { deny: 'no such file' } : { value: text }
   })
   return calls
@@ -379,4 +382,22 @@ test('a long branch name is cut, never the sync counts', async ($, on) => {
   const pane = await mountPane($.ui, 'terminal')
   expect(await pane.find({ text: /^▲ 12$/ })).toBeDefined()
   expect(await pane.find({ text: /^▼ 3$/ })).toBeDefined()
+})
+
+test('untracked files are read once while their size and mtime hold', async ($, on) => {
+  mock.store(on, { shown: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const files = Object.fromEntries(['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'].map(name => [name, 'x\n']))
+  let git: Git = { stdout: SIX_FILES, files }
+  const calls = fakeGit(on, () => git)
+
+  await runChanges($)
+  await clock.advance(2000)
+  await clock.advance(2000)
+  expect(calls.reads).toBe(6)
+
+  git = { stdout: SIX_FILES, files, mtimes: { 'c.ts': 5 } }
+  await clock.advance(2000)
+  expect(calls.reads).toBe(7)
 })

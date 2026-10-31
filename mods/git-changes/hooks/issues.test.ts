@@ -84,3 +84,15 @@ test('fitIssueRow: label drops first, then age; title cut with …', () => {
   const short = fitIssueRow({ ...issue, title: 'Fix', label: undefined }, 48, '1d')
   expect(short).toEqual({ head: '#42 ', title: 'Fix', label: '', age: '1d' })
 })
+
+test('parseIssues: labels and titles lose escape and control characters', () => {
+  const json = JSON.stringify([
+    { number: 1, title: 'Hi\u001b[2J\u009b31mthere', labels: [{ name: '\u001b]0;pwned\u0007bug\u001b[31m' }], updatedAt: '', url: 'u' },
+    { number: 2, title: 'Only junk label', labels: [{ name: '\u001b\u0007 \n' }], updatedAt: '', url: 'u' },
+  ])
+  const [a, b] = parseIssues(json)
+  expect(a?.title).toBe('Hi [2J 31mthere')
+  expect(a?.label).toBe(']0;pwned bug [31m')
+  for (const text of [a?.title ?? '', a?.label ?? '']) expect(text).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/)
+  expect(b?.label).toBeUndefined()
+})

@@ -20,15 +20,22 @@ export function issuesRepoOf(url: string): string | undefined {
   return `${remote.owner}/${remote.repo}-issues`
 }
 
+/**
+ * Text from gh made safe for one terminal row: control characters (C0, DEL,
+ * C1, so no escape sequence can start) and runs of whitespace become one space.
+ */
+function plainText(text: string | undefined) {
+  return (text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ').trim()
+}
+
 /** `gh issue list --json number,title,labels,updatedAt,url` output. Throws on anything but JSON. */
 export function parseIssues(json: string): Issue[] {
   const raw = JSON.parse(json) as Array<{ number: number; title: string; labels?: Array<{ name: string }>; updatedAt: string; url: string }>
   return raw.map(item => {
-    const label = item.labels?.[0]?.name
+    const label = plainText(item.labels?.[0]?.name)
     return {
       number: item.number,
-      // Control characters (newlines, NUL) would break the one-line row.
-      title: item.title.replace(/[\u0000-\u001f\u007f\s]+/g, ' ').trim(),
+      title: plainText(item.title),
       ...(label ? { label } : {}),
       updatedAt: item.updatedAt,
       url: item.url,

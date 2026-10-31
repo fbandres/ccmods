@@ -248,7 +248,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
     const pane = await mountPane($.ui, surface, 9) // 7 fixed rows + 2 files
     expect(await pane.find({ text: 'b.ts' })).toBeDefined()
     expect(await pane.find({ text: 'c.ts' })).toBeUndefined()
-    expect(await pane.find({ text: /… 4 more/ })).toBeDefined()
+    expect(await pane.find({ text: /↓ 4 more/ })).toBeDefined()
+    expect(await pane.find({ text: /above/ })).toBeUndefined()
   })
 
   test(`a first git failure never claims No changes (${surface})`, async ($, on) => {

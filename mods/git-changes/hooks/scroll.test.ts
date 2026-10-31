@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { followed, scrolled, windowOf } from './scroll'
+import { followed, scrolled, stepOf, windowOf } from './scroll'
 
 test('windowOf: everything fits, no markers', () => {
   expect(windowOf(5, 0, 8)).toEqual({ start: 0, end: 5, above: 0, below: 0 })
@@ -37,4 +37,13 @@ test('followed: brings a row into view with the least move', () => {
   expect(followed(0, 7, 40, 8)).toBe(2) // just below: becomes the last visible row of a middle window
   expect(followed(20, 15, 40, 8)).toBe(15) // above: becomes the first row
   expect(followed(0, 39, 40, 8)).toBe(33) // the last row: the end window
+})
+
+test('stepOf: wheel ticks pass through, engine pages become list pages', () => {
+  expect(stepOf(1, 52, 8)).toBe(1)
+  expect(stepOf(-3, 52, 8)).toBe(-3)
+  expect(stepOf(52, 52, 8)).toBe(6) // a page: the rows between the markers
+  expect(stepOf(-52, 52, 8)).toBe(-6)
+  expect(stepOf(52, 52, 2)).toBe(1)
+  expect(stepOf(0, 52, 8)).toBe(0)
 })

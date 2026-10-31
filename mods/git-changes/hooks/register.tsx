@@ -4,6 +4,7 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { FileChange, IssuesState, RepoStatus } from '../types'
 import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
 import type { LineStat } from './status'
+import { scrolled, stepOf, windowOf } from './scroll'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
 import type { Colors, ThemeEntry } from './theme'
 import { DEFAULT_THEMES, isRecord, isThemeNamed, MAX_INCLUDES, parseJsonc, pickBackground, stringsOf, THEME_SLUG, themeFile } from './theme'
@@ -33,6 +34,18 @@ let issuesTimer: { cancel: () => void } | undefined
 let isFetching = false
 let fetchQueued = false // a tab press asked while a fetch ran: fetch once more after it
 let lastIssuesRaw: string | undefined
+
+type Tab = 'changes' | 'issues'
+let tab: Tab = 'changes'
+/** Each tab's first shown row: the mod scrolls its list itself, under a pinned header. */
+const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
+/** What the last drawing measured, for ui.scroll: the list's length, its rows of room, and its first body row. */
+const drawn = { length: 0, room: 1, top: 0, bodyRows: 1 }
+
+/** Rows left for a list (its markers included) under `pinnedRows` of header and footer. */
+function listRoom(bodyRows: number, pinnedRows: number) {
+  return Math.max(1, bodyRows - pinnedRows)
+}
 
 let timer: { cancel: () => void } | undefined
 let isChecking = false
@@ -397,6 +410,19 @@ export const register: Register = on => {
     return ran
   }).catch(($, e, next) => next(e))
 
+  // The header stays: the engine's window never moves, the mod moves its own list and draws again.
+  on('ui.scroll', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    if (e.pointer && e.pointer.row < drawn.top) return {} // a wheel over the header
+    const by = stepOf(e.by, drawn.bodyRows, drawn.room)
+    const next = scrolled(offsets[tab], by, drawn.length, drawn.room)
+    if (next !== offsets[tab]) {
+      offsets[tab] = next
+      await update($, status, now => now && { ...now }) // draws again
+    }
+
+    return {}
+  }).catch(() => ({}))
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const now = await read($, status)
@@ -405,10 +431,12 @@ export const register: Register = on => {
     const width = Math.max(20, e.props.bodyColumns)
     const count = now.files.length
     const isDirty = count > 0
-    const fixedRows = 4 + (isDirty ? 3 : 0) + (now.error ? 1 : 0) // header, dividers, footer; totals, label, "more"; error
-    const room = Math.max(1, e.props.scroll.bodyRows - fixedRows)
-    const shown = now.files.slice(0, room)
-    const hiddenCount = count - shown.length
+    const above = 2 + (isDirty ? 2 : 0) + (now.error ? 1 : 0) // branch, divider; totals, label; error
+    const room = listRoom(e.props.scroll.bodyRows, above + 2) // + divider, footer
+    const window = windowOf(count, offsets.changes, room)
+    offsets.changes = window.start // a list that shrank pulls the window back
+    Object.assign(drawn, { length: count, room, top: above, bodyRows: e.props.scroll.bodyRows })
+    const shown = now.files.slice(window.start, window.end)
     const added = now.files.reduce((sum, file) => sum + (file.added ?? 0), 0)
     const removed = now.files.reduce((sum, file) => sum + (file.removed ?? 0), 0)
     const divider = <Text dimColor>{'─'.repeat(width)}</Text>
@@ -458,6 +486,7 @@ export const register: Register = on => {
             <Text color="success">✔ Working tree clean</Text>
           </Box>
         )}
+        {window.above > 0 && <Text dimColor> ↑ {window.above} above</Text>}
         {shown.map(file => {
           const color = LETTER_COLOR[file.letter]
           const row = fitRow(file.path, width - 4 - (hasCounts ? countsWidth + 1 : 0))
@@ -483,7 +512,7 @@ export const register: Register = on => {
             </Box>
           )
         })}
-        {hiddenCount > 0 && <Text dimColor> … {hiddenCount} more</Text>}
+        {window.below > 0 && <Text dimColor> ↓ {window.below} more</Text>}
         {divider}
         <Text dimColor>updated {new Date(now.updatedAt).toTimeString().slice(0, 8)} · /{commandName}</Text>
       </Box>

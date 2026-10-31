@@ -43,3 +43,12 @@ export function followed(offset: number, index: number, length: number, room: nu
 
   return now.start
 }
+
+/**
+ * Rows to move for a `ui.scroll` step: a wheel tick as given, an engine page
+ * (`by` of a whole body or more) as one list page, the rows between the markers.
+ */
+export function stepOf(by: number, bodyRows: number, room: number): number {
+  if (Math.abs(by) < bodyRows) return by
+  return Math.sign(by) * Math.max(1, room - 2)
+}

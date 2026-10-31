@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { ageOf, classifyGhFailure, fitIssueRow, issuesRepoOf, parseIssues, parseRemote } from './issues'
+import { ageOf, classifyGhFailure, fitIssueRow, issuesRepoOf, parseIssues, parseRemote, tabTexts } from './issues'
+import { widthOf } from './text'
 
 const SSH = 'git' // the scp-style ssh user, kept apart so the repo's leak scan doesn't read an email
 
@@ -95,4 +96,35 @@ test('parseIssues: labels and titles lose escape and control characters', () => 
   expect(a?.label).toBe(']0;pwned bug [31m')
   for (const text of [a?.title ?? '', a?.label ?? '']) expect(text).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/)
   expect(b?.label).toBeUndefined()
+})
+
+test('parseIssues: bidi and zero-width controls are removed', () => {
+  const json = JSON.stringify([
+    { number: 1, title: 'safe‮gnp.exe⁦x​y﻿', labels: [{ name: '‭bug⁩' }], updatedAt: '', url: 'u' },
+  ])
+  const [a] = parseIssues(json)
+  expect(a?.title).toBe('safegnp.exexy')
+  expect(a?.label).toBe('bug')
+})
+
+test('fitIssueRow: wide titles and labels fit by columns, not characters', () => {
+  const issue = { number: 7, title: '日本語のタイトルがとても長い場合の表示テスト', label: 'バグ報告です', updatedAt: '', url: '' }
+  for (const width of [20, 30, 48]) {
+    const row = fitIssueRow(issue, width, '2d')
+    const tail = (row.label ? widthOf(row.label) + 1 : 0) + (row.age ? widthOf(row.age) + 1 : 0)
+    expect(widthOf(row.head) + widthOf(row.title) + tail).toBeLessThanOrEqual(width)
+    expect(row.title.endsWith('…')).toBe(true)
+  }
+  expect(widthOf(fitIssueRow(issue, 48, '2d').label)).toBeLessThanOrEqual(10)
+})
+
+test('tabTexts: full names, then short, then letters, always within the width', () => {
+  expect(tabTexts(40, { changes: '2', issues: '5' }, 'changes')).toEqual({ changes: '[Changes 2]', issues: ' Issues 5 ' })
+  expect(tabTexts(40, { changes: '2', issues: '5' }, 'issues')).toEqual({ changes: ' Changes 2 ', issues: '[Issues 5]' })
+  expect(tabTexts(20, { changes: '999', issues: '100+' }, 'changes')).toEqual({ changes: '[Chg 999]', issues: ' Iss 100+ ' })
+  expect(tabTexts(20, { changes: '123456', issues: '100+' }, 'issues')).toEqual({ changes: ' C 123456 ', issues: '[I 100+]' })
+  for (const width of [20, 22, 25, 26, 30]) {
+    const t = tabTexts(width, { changes: '1234', issues: '100+' }, 'changes')
+    expect(t.changes.length + 1 + t.issues.length).toBeLessThanOrEqual(width)
+  }
 })

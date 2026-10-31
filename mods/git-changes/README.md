@@ -63,7 +63,8 @@ Or install it yourself:
 - The Issues tab needs the [GitHub CLI](https://cli.github.com) installed and logged in (`gh auth login`). It only recognises `github.com` remotes and only looks at `origin`. It lists up to 100 issues (the tab reads `Issues 100+` past that).
 - An issue opens with `xdg-open` (Linux) or `open` (macOS). If neither works, its URL is copied to the clipboard instead.
 - Claude Code fills the docked pane with its theme's `composerSidebarBackground` color, and a mod can't change that directly. In a VS Code-family terminal (VS Code, Cursor, …) the mod reads your editor theme on start and writes its terminal background into `~/.claude/themes/editor-match.json`. Pick **Match editor (git-changes)** once with `/theme`. An editor theme change applies from the next session.
-- Wide characters (CJK, emoji) in file names can push a row past its column.
+- Row widths count wide characters (CJK, emoji) as two columns using a built-in table. A few rare symbols may still measure one column off in some terminals.
+- The Issues tab isn't looked up in non-interactive runs (`claude -p`, the SDK).
 
 ## License
 

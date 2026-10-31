@@ -1,4 +1,5 @@
 import type { Issue } from '../types'
+import { cutTo, widthOf } from './text'
 
 /** `gh issue list --limit`: more than this reads `100+`. */
 export const ISSUES_LIMIT = 100
@@ -22,10 +23,15 @@ export function issuesRepoOf(url: string): string | undefined {
 
 /**
  * Text from gh made safe for one terminal row: control characters (C0, DEL,
- * C1, so no escape sequence can start) and runs of whitespace become one space.
+ * C1, so no escape sequence can start) and runs of whitespace become one space;
+ * bidi controls (which can reorder what the row shows) and zero-width
+ * characters go.
  */
 function plainText(text: string | undefined) {
-  return (text ?? '').replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ').trim()
+  return (text ?? '')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g, '')
+    .replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ')
+    .trim()
 }
 
 /** `gh issue list --json number,title,labels,updatedAt,url` output. Throws on anything but JSON. */
@@ -68,11 +74,6 @@ export function ageOf(iso: string, now: number): string {
   return `${Math.floor(days / 365)}y`
 }
 
-function cut(text: string, width: number) {
-  if (text.length <= width) return text
-  return width > 1 ? `${text.slice(0, width - 1)}…` : text.slice(0, Math.max(0, width))
-}
-
 /**
  * An issue row fitted to `width` columns: `#N `, the title, then the label
  * and the age, each after a space. The label drops first, then the age, so
@@ -80,11 +81,32 @@ function cut(text: string, width: number) {
  */
 export function fitIssueRow(issue: Issue, width: number, age: string) {
   const head = `#${issue.number} `
-  let label = issue.label ? cut(issue.label, LABEL_COLUMNS) : ''
+  let label = issue.label ? cutTo(issue.label, LABEL_COLUMNS) : ''
   let shownAge = age
-  const tail = () => (label ? label.length + 1 : 0) + (shownAge ? shownAge.length + 1 : 0)
+  const tail = () => (label ? widthOf(label) + 1 : 0) + (shownAge ? widthOf(shownAge) + 1 : 0)
   if (label && head.length + MIN_TITLE + tail() > width) label = ''
   if (shownAge && head.length + MIN_TITLE + tail() > width) shownAge = ''
 
-  return { head, title: cut(issue.title, width - head.length - tail()), label, age: shownAge }
+  return { head, title: cutTo(issue.title, width - head.length - tail()), label, age: shownAge }
+}
+
+const TAB_NAMES = [
+  ['Changes', 'Issues'],
+  ['Chg', 'Iss'],
+  ['C', 'I'],
+] as const
+
+/**
+ * The two tab labels for `width` columns (one space between them): the active
+ * one in brackets. Full names, then short ones, then letters, so the bar
+ * stays on one row.
+ */
+export function tabTexts(width: number, counts: { changes: string; issues: string }, active: 'changes' | 'issues') {
+  const text = (name: string, n: string, isActive: boolean) => (isActive ? `[${name} ${n}]` : ` ${name} ${n} `)
+  let texts = { changes: '', issues: '' }
+  for (const [changes, issues] of TAB_NAMES) {
+    texts = { changes: text(changes, counts.changes, active === 'changes'), issues: text(issues, counts.issues, active === 'issues') }
+    if (texts.changes.length + 1 + texts.issues.length <= width) break
+  }
+  return texts
 }

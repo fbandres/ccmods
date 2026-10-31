@@ -71,6 +71,8 @@ type Gh = {
   /** `gh issue list` JSON; default `[]`. */
   list?: string
   listError?: string
+  /** When set, `gh issue list` waits for it before answering. */
+  listGate?: Promise<void>
 }
 
 const ORIGIN = 'https://github.com/fbandres/oscp-app.git'
@@ -103,6 +105,7 @@ async function answerGh(gh: Gh | undefined, argv: readonly string[]) {
     if (gh.repo === 'hang') return { deny: 'gh is still running after 30000 ms' }
     return ran(0, '{"name":"oscp-app-issues"}', '')
   }
+  if (argv[1] === 'issue' && gh.listGate) await gh.listGate
   if (argv[1] === 'issue') return gh.listError ? ran(1, '', gh.listError) : ran(0, gh.list ?? '[]', '')
   return ran(1, '', 'unknown gh command')
 }
@@ -1014,4 +1017,63 @@ test('an issue row with no label or age never runs past a narrow pane', async ($
   const row = await pane.find({ key: 'issue-1234' })
   expect(row).toBeDefined()
   expect(row!.text.length).toBeLessThanOrEqual(20)
+})
+
+test('a narrow pane keeps the tab bar on one row with short names', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { list: issuesJson(100) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal', 20, 20)
+  expect(await pane.find({ text: /^\[Chg 2\]$/ })).toBeDefined()
+  expect(await pane.find({ text: /^ Iss 100\+ $/ })).toBeDefined()
+})
+
+test('the Issues tab says Reading issues… until the first list lands', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gate = held()
+  fakeGit(on, () => ({ gh: { listGate: gate.promise, list: issuesJson(2) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  await pane.press({ key: 'tab-issues' })
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ text: /Reading issues…/ })).toBeDefined()
+  expect(await pane.find({ text: /No open issues/ })).toBeUndefined()
+
+  gate.release()
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ text: /Reading issues…/ })).toBeUndefined()
+  expect(await pane.find({ key: 'issue-2' })).toBeDefined()
+})
+
+test('a reply from gh that is not JSON says so, not that gh could not run', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const issues = watchIssues(on)
+  fakeGit(on, () => ({ gh: { list: '<html>rate limited</html>' } }))
+  await startSession($, on)
+
+  expect(issues.value?.error).toBe('GitHub: unexpected reply from gh')
+})
+
+test('a non-interactive start (claude -p, the SDK) never calls gh', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const calls = fakeGit(on, () => ({ gh: { list: issuesJson(2) } }))
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: ROOT, surface: null, isInteractive: false })
+  await settle()
+  await clock.advance(60_000)
+  await settle()
+
+  expect(calls.argv.filter(argv => argv[0] === 'gh')).toHaveLength(0)
 })

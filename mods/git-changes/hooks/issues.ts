@@ -27,7 +27,7 @@ export function issuesRepoOf(url: string): string | undefined {
  * bidi controls (which can reorder what the row shows) and zero-width
  * characters go.
  */
-function plainText(text: string | undefined) {
+export function plainText(text: string | undefined) {
   return (text ?? '')
     .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g, '')
     .replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ')

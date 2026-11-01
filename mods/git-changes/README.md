@@ -2,7 +2,7 @@
 
 A live Source Control pane for Claude Code: see which files changed, and by how much, without running `git status`. On GitHub repos it also lists the open pull requests, and if the project keeps its GitHub issues in a `<repo>-issues` repo, the pane shows those too.
 
-![git-changes pane](screenshot.png)
+<img src="screenshot.png" alt="git-changes pane on the PRs tab" width="404">
 
 ## What it does
 

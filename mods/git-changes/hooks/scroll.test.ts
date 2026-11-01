@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
+import { arrivalOf, followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
 
 test('windowOf: everything fits, no markers', () => {
   expect(windowOf(5, 0, 8)).toEqual({ start: 0, end: 5, above: 0, below: 0 })
@@ -59,4 +59,16 @@ test('wrapMove: only the ring stepping off an edge row onto its neighbour button
   const end = windowOf(40, 33, 8) // nothing below
   expect(wrapMove(39, 'after', end)).toBe(0)
   expect(wrapMove(-1, 33, end)).toBe(0) // first focus
+})
+
+test('arrivalOf: any tab above the list is before it, the more row after, a row its index', () => {
+  expect(arrivalOf('tab-prs', 'issues', [5, 4])).toBe('before')
+  expect(arrivalOf('tab-changes', 'issues', [5, 4])).toBe('before')
+  expect(arrivalOf('tab-prs', 'prs', [9])).toBe('before')
+  expect(arrivalOf('issues-more', 'issues', [5, 4])).toBe('after')
+  expect(arrivalOf('prs-more', 'prs', [9])).toBe('after')
+  expect(arrivalOf('issue-4', 'issues', [5, 4])).toBe(1)
+  expect(arrivalOf('pr-9', 'prs', [9])).toBe(0)
+  expect(arrivalOf('pr-9', 'issues', [9])).toBe(-1)
+  expect(arrivalOf(undefined, 'prs', [9])).toBe(-1)
 })

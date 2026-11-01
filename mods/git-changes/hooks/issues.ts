@@ -27,7 +27,7 @@ export function issuesRepoOf(url: string): string | undefined {
  * bidi controls (which can reorder what the row shows) and zero-width
  * characters go.
  */
-function plainText(text: string | undefined) {
+export function plainText(text: string | undefined) {
   return (text ?? '')
     .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g, '')
     .replace(/[\u0000-\u001f\u007f-\u009f\s]+/g, ' ')
@@ -88,25 +88,4 @@ export function fitIssueRow(issue: Issue, width: number, age: string) {
   if (shownAge && head.length + MIN_TITLE + tail() > width) shownAge = ''
 
   return { head, title: cutTo(issue.title, width - head.length - tail()), label, age: shownAge }
-}
-
-const TAB_NAMES = [
-  ['Changes', 'Issues'],
-  ['Chg', 'Iss'],
-  ['C', 'I'],
-] as const
-
-/**
- * The two tab labels for `width` columns (one space between them): the active
- * one in brackets. Full names, then short ones, then letters, so the bar
- * stays on one row.
- */
-export function tabTexts(width: number, counts: { changes: string; issues: string }, active: 'changes' | 'issues') {
-  const text = (name: string, n: string, isActive: boolean) => (isActive ? `[${name} ${n}]` : ` ${name} ${n} `)
-  let texts = { changes: '', issues: '' }
-  for (const [changes, issues] of TAB_NAMES) {
-    texts = { changes: text(changes, counts.changes, active === 'changes'), issues: text(issues, counts.issues, active === 'issues') }
-    if (texts.changes.length + 1 + texts.issues.length <= width) break
-  }
-  return texts
 }

@@ -6,7 +6,7 @@
     {
       "name": "git-changes",
       "source": "./mods/git-changes",
-      "description": "Live Source Control pane: changed files, status letters and +/- line counts. Toggle with /changes."
+      "description": "Live Source Control pane: changed files with +/- line counts, open pull requests and GitHub issues. Toggle with /changes."
     },
     {
       "name": "wpm-gauge",

@@ -1,12 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register } from 'claude-code'
 
-import type { FileChange, IssuesState, RepoStatus } from '../types'
+import type { FileChange, IssuesState, PrsState, RepoStatus } from '../types'
 import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
+import { fitPrRow, MARK_COLOR, parsePrs, PRS_LIMIT, prsRepoOf, worstMark } from './prs'
 import type { LineStat } from './status'
-import { ageOf, fitIssueRow, tabTexts } from './issues'
-import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
+import { ageOf, fitIssueRow } from './issues'
+import { arrivalOf, followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
+import type { TabId } from './tabs'
+import { tabTexts } from './tabs'
 import { widthOf } from './text'
 import type { Colors, ThemeEntry } from './theme'
 import { DEFAULT_THEMES, isRecord, isThemeNamed, MAX_INCLUDES, parseJsonc, pickBackground, stringsOf, THEME_SLUG, themeFile } from './theme'
@@ -29,6 +32,7 @@ const MAX_COUNTED_BYTES = 256 * 1024
 
 const status = atom({ plugin: 'git-changes', key: 'status' } as const, null as RepoStatus | null)
 const issues = atom({ plugin: 'git-changes', key: 'issues' } as const, null as IssuesState | null)
+const prs = atom({ plugin: 'git-changes', key: 'prs' } as const, null as PrsState | null)
 
 /** Where the `<repo>-issues` lookup stands: `none` and `off` are final for the session, `retrying` is not. */
 type Detection = { kind: 'off' } | { kind: 'none'; reason: string } | { kind: 'retrying' } | { kind: 'detected'; target: string }
@@ -38,10 +42,24 @@ let isFetching = false
 let fetchQueued = false // a tab press asked while a fetch ran: fetch once more after it
 let lastIssuesRaw: string | undefined
 
-type Tab = 'changes' | 'issues'
+/**
+ * Where the PR list stands: `pending` until the first `gh pr list` answers (no
+ * tab yet), then `ready`; `none` and `off` are final for the session.
+ */
+type PrSource = { kind: 'off' } | { kind: 'none'; reason: string } | { kind: 'pending'; target: string } | { kind: 'ready'; target: string }
+let prSource: PrSource = { kind: 'off' }
+let me: string | undefined // gh's login: these PRs' numbers draw bold
+let isFetchingPrs = false
+let prsInFlight: Promise<void> | undefined // the running fetch, for a new lookup to wait out
+let prsQueued = false // a tab press asked while a fetch ran: fetch once more after it
+let lastPrsRaw: string | undefined
+/** Bumped by every lookup and by turning PRs off: a slower, older answer is then dropped. */
+let prsRun = 0
+
+type Tab = TabId
 let tab: Tab = 'changes'
 /** Each tab's first shown row: the mod scrolls its list itself, under a pinned header. */
-const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
+const offsets: Record<Tab, number> = { changes: 0, issues: 0, prs: 0 }
 /**
  * What each tab's last drawing measured, for ui.scroll and ui.focus: the list's
  * length, its rows of room, and its first body row. Per tab, so a hook that
@@ -50,10 +68,11 @@ const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
 const drawn: Record<Tab, { length: number; room: number; top: number; bodyRows: number }> = {
   changes: { length: 0, room: 1, top: 0, bodyRows: 1 },
   issues: { length: 0, room: 1, top: 0, bodyRows: 1 },
+  prs: { length: 0, room: 1, top: 0, bodyRows: 1 },
 }
 
-/** The number of the issue row the ring was last on; a number survives a fetch that re-sorts the list. */
-let focusedIssue: number | undefined
+/** The number of the issue or PR row the ring was last on; a number survives a fetch that re-sorts the list. */
+let focusedRow: number | undefined
 
 /** Opens `url` in the browser: xdg-open (Linux), then open (macOS), else copies it. */
 async function openUrl($: Engine, url: string, surface: unknown) {
@@ -289,7 +308,7 @@ function startTimer($: Engine) {
   timer?.cancel()
   timer = $.clock.every(INTERVAL_MS, () => void tick($))
   issuesTimer?.cancel()
-  issuesTimer = $.clock.every(ISSUES_INTERVAL_MS, () => void issuesTick($).catch(() => {}))
+  issuesTimer = $.clock.every(ISSUES_INTERVAL_MS, () => void githubTick($).catch(() => {}))
 }
 
 function stopTimers() {
@@ -299,8 +318,9 @@ function stopTimers() {
   issuesTimer = undefined
 }
 
-async function issuesTick($: Engine) {
+async function githubTick($: Engine) {
   if (!(await isPlaced($))) return
+  if (prSource.kind === 'ready') void fetchPrs($).catch(() => {})
   if (detection.kind === 'retrying') await detectIssues($)
   else if (detection.kind === 'detected') await fetchIssues($)
 }
@@ -398,6 +418,121 @@ async function fetchIssues($: Engine, isUrgent = false): Promise<void> {
   }
 }
 
+/** Whether gh is on this machine, when running it rejected: a hang and a missing binary both reject. */
+function hasGh($: Engine) {
+  return $.process.run(['gh', '--version'], { timeoutMs: 5000 } as never).then(
+    () => true,
+    () => false,
+  )
+}
+
+/** Finds `<owner>/<repo>` from origin and fetches its PRs once (awaited); the login is read alongside. */
+async function findPrs($: Engine) {
+  const run = ++prsRun
+  if ((await $.store.get('prs')) === false) {
+    if (run === prsRun) prSource = { kind: 'off' }
+    return
+  }
+  const origin = await $.process.run(['git', 'remote', 'get-url', 'origin']).catch(() => undefined)
+  const target = origin?.exitCode === 0 ? prsRepoOf(origin.stdout) : undefined
+  if (run !== prsRun) return
+  if (!target) {
+    prSource = { kind: 'none', reason: 'origin is not a GitHub repo' }
+    return
+  }
+  prSource = { kind: 'pending', target }
+  if (me === undefined) void readLogin($)
+  await prsInFlight?.catch(() => {}) // an older fetch still running would turn this one away
+  if (run !== prsRun) return
+  await fetchPrs($)
+}
+
+let isLoginRead = false
+/** gh's login, once per session; a failure leaves nothing bold. */
+async function readLogin($: Engine) {
+  if (isLoginRead) return
+  isLoginRead = true
+  try {
+    const run = await $.process.run(['gh', 'api', 'user', '--jq', '.login'])
+    if (run.exitCode === 0) me = run.stdout.trim() || undefined
+  } catch {
+    // No login: nothing is bold.
+  }
+}
+
+/**
+ * Reads the open PRs. While `pending`, a definitive failure ends the lookup
+ * (no tab); anything else makes the source `ready`, a failure keeping the last
+ * list and setting `error`.
+ */
+async function fetchPrs($: Engine, isUrgent = false): Promise<void> {
+  if (prSource.kind !== 'pending' && prSource.kind !== 'ready') return
+  if (isFetchingPrs) {
+    if (isUrgent) prsQueued = true
+    return
+  }
+  isFetchingPrs = true
+  const running = fetchPrsOnce($, prSource.target)
+  prsInFlight = running
+  return running
+}
+
+/** One `gh pr list` for `target`; the caller has set `isFetchingPrs`, and the `finally` clears it. */
+async function fetchPrsOnce($: Engine, target: string): Promise<void> {
+  const run = prsRun
+  const isCurrent = () => run === prsRun
+  const ready = () => {
+    prSource = { kind: 'ready', target }
+  }
+  const failed = async (error: string) => {
+    lastPrsRaw = undefined
+    ready()
+    await update($, prs, now => ({ ...(now ?? { prs: [], isLoaded: false, isCapped: false, updatedAt: Date.now() }), error }))
+  }
+  try {
+    let answer: { exitCode: number; stdout: string; stderr: string }
+    try {
+      answer = await $.process.run([
+        'gh', 'pr', 'list', '-R', target, '--state', 'open', '--limit', String(PRS_LIMIT),
+        '--json', 'number,title,isDraft,reviewDecision,statusCheckRollup,author,updatedAt,url',
+      ])
+    } catch {
+      const isInstalled = await hasGh($)
+      if (!isCurrent()) return
+      if (!isInstalled && prSource.kind === 'pending') prSource = { kind: 'none', reason: 'gh is not installed' }
+      else await failed('GitHub: gh could not be run')
+      return
+    }
+    if (!isCurrent()) return
+    if (answer.exitCode !== 0) {
+      const failure = answer.exitCode === 4 ? 'logged-out' : classifyGhFailure(answer.stderr)
+      if (prSource.kind === 'pending' && failure === 'logged-out') prSource = { kind: 'none', reason: 'gh is not logged in (run: gh auth login)' }
+      else if (prSource.kind === 'pending' && failure === 'not-found') prSource = { kind: 'none', reason: `${target} not found or no access` }
+      else await failed(`GitHub: ${firstLine(answer.stderr)}`)
+      return
+    }
+    ready()
+    if (answer.stdout === lastPrsRaw && (await read($, prs)) !== null) return
+    let list: ReturnType<typeof parsePrs>
+    try {
+      list = parsePrs(answer.stdout)
+    } catch {
+      await failed('GitHub: unexpected reply from gh')
+      return
+    }
+    lastPrsRaw = answer.stdout
+    await update($, prs, () => ({ prs: list, isLoaded: true, isCapped: list.length >= PRS_LIMIT, updatedAt: Date.now() }))
+  } catch {
+    if (isCurrent()) await failed('GitHub: gh could not be run').catch(() => {})
+  } finally {
+    isFetchingPrs = false
+    if (prsQueued) {
+      prsQueued = false
+      void fetchPrs($).catch(() => {})
+    }
+  }
+}
+
 async function show($: Engine) {
   startTimer($)
   lastRaw = undefined // reopening always redraws from a fresh read
@@ -429,7 +564,7 @@ async function toggleIssues($: Engine) {
   if (!isOn) {
     detectRun++ // a detection still running drops its answer
     detection = { kind: 'off' }
-    focusedIssue = undefined
+    focusedRow = undefined
     tab = 'changes'
     lastIssuesRaw = undefined
     await update($, issues, () => null)
@@ -445,12 +580,35 @@ async function toggleIssues($: Engine) {
   return { text: 'Issues tab shown.' }
 }
 
-/** What `/changes <args>` does: no args toggles the pane, `issues` the Issues tab. */
+/** `/changes prs`: the PRs tab off or on, remembered on this machine. */
+async function togglePrs($: Engine) {
+  const isOn = (await $.store.get('prs')) === false
+  await $.store.set('prs', isOn)
+  if (!isOn) {
+    prsRun++ // a lookup or fetch still running drops its answer
+    prSource = { kind: 'off' }
+    if (tab === 'prs') tab = 'changes'
+    lastPrsRaw = undefined
+    await update($, prs, () => null)
+    await update($, status, now => now && { ...now }) // draws without the tab
+    return { text: 'PRs tab hidden.' }
+  }
+  await findPrs($)
+  await update($, status, now => now && { ...now })
+  const found: PrSource = prSource
+  if (found.kind === 'none') return { text: `PRs tab on, but it can't be shown: ${found.reason}.` }
+  const error = found.kind === 'ready' ? (await read($, prs))?.error : undefined
+  if (error) return { text: 'PRs tab on; GitHub is unreachable right now, retrying every minute.' }
+  return { text: 'PRs tab shown.' }
+}
+
+/** What `/changes <args>` does: no args toggles the pane, `issues` and `prs` their tabs. */
 async function runCommand($: Engine, args: string) {
   const word = args.trim().toLowerCase()
   if (word === '') return toggle($)
   if (word === 'issues') return toggleIssues($)
-  return { text: `Usage: /${commandName} [issues]` }
+  if (word === 'prs') return togglePrs($)
+  return { text: `Usage: /${commandName} [issues|prs]` }
 }
 
 async function hide($: Engine) {
@@ -463,7 +621,11 @@ export const register: Register = on => {
     await registerCommand($)
     const isGit = await isRepo($)
     if (isGit && (await $.store.get('shown')) !== false) await showOnStart($)
-    if (isGit && e.isInteractive) void detectIssues($).catch(() => {}) // GitHub never holds the session; -p and the SDK skip it
+    if (isGit && e.isInteractive) {
+      // GitHub never holds the session; -p and the SDK skip it
+      void detectIssues($).catch(() => {})
+      void findPrs($).catch(() => {})
+    }
     void syncEditorTheme($).catch(() => {}) // the pane's fill follows the editor; never holds the session
 
     return next(e)
@@ -505,31 +667,34 @@ export const register: Register = on => {
 
   // Arrows move the ring between drawn rows; past an edge with rows beyond it, the list follows.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
-    if (tab !== 'issues') {
-      focusedIssue = undefined
+    if (tab === 'changes') {
+      focusedRow = undefined
       return next(e)
     }
-    const items = (await read($, issues))?.issues ?? []
-    const indexOf = (number: number | undefined) => items.findIndex(issue => issue.number === number)
-    const number = /^issue-(\d+)$/.exec(e.element ?? '')?.[1]
-    const arrived = e.element === 'issues-more' ? 'after' : e.element === 'tab-issues' ? 'before' : indexOf(Number(number))
-    const previous = indexOf(focusedIssue)
-    const window = windowOf(items.length, offsets.issues, drawn.issues.room)
+    const list = tab
+    const isPrs = list === 'prs'
+    const prefix = isPrs ? 'pr-' : 'issue-'
+    const numbers = isPrs ? ((await read($, prs))?.prs ?? []).map(pr => pr.number) : ((await read($, issues))?.issues ?? []).map(issue => issue.number)
+    const indexOf = (number: number | undefined) => numbers.indexOf(number ?? Number.NaN)
+    const number = new RegExp(`^${prefix}(\\d+)$`).exec(e.element ?? '')?.[1]
+    const arrived = arrivalOf(e.element, list, numbers)
+    const previous = indexOf(focusedRow)
+    const window = windowOf(numbers.length, offsets[list], drawn[list].room)
     const move = e.origin.kind === 'person' ? wrapMove(previous, arrived, window) : 0
     if (move === 0) {
-      focusedIssue = number === undefined ? undefined : Number(number)
+      focusedRow = number === undefined ? undefined : Number(number)
       return next(e)
     }
-    const stay = items[previous]
-    const target = items[previous + move]
-    if (!stay || !target) return next(e)
-    offsets.issues = followed(offsets.issues, previous + move, items.length, drawn.issues.room)
-    focusedIssue = target.number
-    await update($, issues, now => now && { ...now }) // draws the new row
-    const key = `issue-${target.number}`
+    const stay = numbers[previous]
+    const target = numbers[previous + move]
+    if (stay === undefined || target === undefined) return next(e)
+    offsets[list] = followed(offsets[list], previous + move, numbers.length, drawn[list].room)
+    focusedRow = target
+    await update($, status, now => now && { ...now }) // draws the new row
+    const key = `${prefix}${target}`
     $.clock.after(REFOCUS_MS, () => void $.ui.focus({ requestId: PANE, key } as never).catch(() => {}))
 
-    return next({ ...e, element: `issue-${stay.number}` }) // the ring waits on the row it left
+    return next({ ...e, element: `${prefix}${stay}` }) // the ring waits on the row it left
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -537,11 +702,15 @@ export const register: Register = on => {
     const now = await read($, status)
     if (!now) return <Text dimColor>Reading git status…</Text>
 
-    // Read the issues every time: the read subscribes this pane, so a detection that lands later draws the tab bar.
+    // Read both lists every time: the read subscribes this pane, so a lookup that lands later draws the tab bar.
     const fetched = await read($, issues)
-    const hasTabs = detection.kind === 'detected'
-    if (!hasTabs) tab = 'changes'
-    const known = hasTabs ? fetched : null
+    const fetchedPrs = await read($, prs)
+    const hasIssues = detection.kind === 'detected'
+    const hasPrs = prSource.kind === 'ready'
+    const hasTabs = hasIssues || hasPrs
+    if ((tab === 'issues' && !hasIssues) || (tab === 'prs' && !hasPrs)) tab = 'changes'
+    const known = hasIssues ? fetched : null
+    const knownPrs = hasPrs ? fetchedPrs : null
     const width = Math.max(20, e.props.bodyColumns)
     const bodyRows = e.props.scroll.bodyRows
     const count = now.files.length
@@ -567,25 +736,47 @@ export const register: Register = on => {
     )
 
     const issuesCount = !known ? '…' : known.isCapped ? `${ISSUES_LIMIT}+` : String(known.issues.length)
-    const texts = tabTexts(width, { changes: String(count), issues: issuesCount }, tab)
-    const tabButton = (which: Tab, onPress: () => void) => (
-      <Button key={`tab-${which}`} plain onPress={onPress}>
-        {tab === which ? <Text bold>{texts[which]}</Text> : <Text dimColor>{texts[which]}</Text>}
-      </Button>
+    const prsCount = !knownPrs?.isLoaded ? '…' : knownPrs.isCapped ? `${PRS_LIMIT}+` : String(knownPrs.prs.length)
+    const worst = worstMark(knownPrs?.prs ?? [])
+    const texts = tabTexts(
+      width,
+      { changes: String(count), ...(hasIssues ? { issues: issuesCount } : {}), ...(hasPrs ? { prs: prsCount } : {}) },
+      tab,
     )
+    const tabButton = (which: Tab, countColor?: string) => {
+      const text = texts[which]
+      if (!text) return null
+      const onPress = () => {
+        tab = which
+        focusedRow = undefined
+        redraw()
+        if (which === 'issues') void fetchIssues($, true).catch(() => {})
+        if (which === 'prs') void fetchPrs($, true).catch(() => {})
+      }
+      const shown = <Text color={countColor}>{text.count}</Text>
+      return (
+        <Button key={`tab-${which}`} plain onPress={onPress}>
+          {tab === which ? (
+            <Text bold>
+              {text.before}
+              {shown}
+              {text.after}
+            </Text>
+          ) : (
+            <Text dimColor>
+              {text.before}
+              {shown}
+              {text.after}
+            </Text>
+          )}
+        </Button>
+      )
+    }
     const tabBar = hasTabs && (
       <Box gap={1}>
-        {tabButton('changes', () => {
-          tab = 'changes'
-          focusedIssue = undefined
-          redraw()
-        })}
-        {tabButton('issues', () => {
-          tab = 'issues'
-          focusedIssue = undefined
-          redraw()
-          void fetchIssues($, true).catch(() => {})
-        })}
+        {tabButton('changes')}
+        {tabButton('issues')}
+        {tabButton('prs', worst === '✗' ? 'error' : worst === 'R' ? MARK_COLOR.R : undefined)}
       </Box>
     )
     const footer = (at: number) => (
@@ -594,14 +785,23 @@ export const register: Register = on => {
       </Text>
     )
 
-    if (tab === 'issues' && detection.kind === 'detected') {
-      const items = known?.issues ?? []
-      const above = 3 + (known?.error ? 1 : 0) // branch, tabs, divider; error
+    /** The Issues and PRs tabs' body: error, reading or empty line, the scrolled rows, the more button. */
+    const githubBody = <T,>(list: {
+      tab: 'issues' | 'prs'
+      items: readonly T[]
+      error?: string
+      isLoaded: boolean
+      readingText: string
+      emptyText: string
+      moreUrl: string
+      updatedAt: number
+      row: (item: T, at: number) => unknown
+    }) => {
+      const above = 3 + (list.error ? 1 : 0) // branch, tabs, divider; error
       const room = listRoom(bodyRows, above + 2) // + divider, footer
-      const window = windowOf(items.length, offsets.issues, room)
-      offsets.issues = window.start
-      Object.assign(drawn.issues, { length: items.length, room, top: above, bodyRows })
-      const listUrl = `https://github.com/${detection.target}/issues`
+      const window = windowOf(list.items.length, offsets[list.tab], room)
+      offsets[list.tab] = window.start
+      Object.assign(drawn[list.tab], { length: list.items.length, room, top: above, bodyRows })
       const at = Date.now()
 
       return (
@@ -609,36 +809,79 @@ export const register: Register = on => {
           {branchRow}
           {tabBar}
           {divider}
-          {known?.error && <Text color="error">{known.error}</Text>}
-          {!known && <Text dimColor>Reading issues…</Text>}
-          {known && items.length === 0 && (
+          {list.error && <Text color="error">{list.error}</Text>}
+          {!list.isLoaded && !list.error && <Text dimColor>{list.readingText}</Text>}
+          {list.isLoaded && list.items.length === 0 && (
             <Box justifyContent="center">
-              <Text color="success">✔ No open issues</Text>
+              <Text color="success">{list.emptyText}</Text>
             </Box>
           )}
           {window.above > 0 && <Text dimColor> ↑ {window.above} above</Text>}
-          {items.slice(window.start, window.end).map(issue => {
-            const row = fitIssueRow(issue, width, ageOf(issue.updatedAt, at))
-            const tail = widthOf(row.label) + (row.label && row.age ? 1 : 0) + row.age.length
-            const pad = tail ? ' '.repeat(Math.max(1, width - row.head.length - widthOf(row.title) - tail)) : ''
-            return (
-              <Button key={`issue-${issue.number}`} plain onPress={press => void openUrl($, issue.url, press.surface)}>
-                <Text wrap="truncate-end">{`${row.head}${row.title}${pad}`}</Text>
-                {row.label && <Text dimColor>{row.label}</Text>}
-                {row.label && row.age ? ' ' : ''}
-                {row.age}
-              </Button>
-            )
-          })}
+          {list.items.slice(window.start, window.end).map(item => list.row(item, at) as never)}
           {window.below > 0 && (
-            <Button key="issues-more" plain dimColor onPress={press => void openUrl($, listUrl, press.surface)}>
+            <Button key={`${list.tab}-more`} plain dimColor onPress={press => void openUrl($, list.moreUrl, press.surface)}>
               {` ↓ ${window.below} more`}
             </Button>
           )}
           {divider}
-          {footer(known?.updatedAt ?? now.updatedAt)}
+          {footer(list.updatedAt)}
         </Box>
       )
+    }
+
+    if (tab === 'issues' && detection.kind === 'detected') {
+      return githubBody({
+        tab: 'issues',
+        items: known?.issues ?? [],
+        error: known?.error,
+        isLoaded: known !== null,
+        readingText: 'Reading issues…',
+        emptyText: '✔ No open issues',
+        moreUrl: `https://github.com/${detection.target}/issues`,
+        updatedAt: known?.updatedAt ?? now.updatedAt,
+        row: (issue, at) => {
+          const row = fitIssueRow(issue, width, ageOf(issue.updatedAt, at))
+          const tail = widthOf(row.label) + (row.label && row.age ? 1 : 0) + row.age.length
+          const pad = tail ? ' '.repeat(Math.max(1, width - row.head.length - widthOf(row.title) - tail)) : ''
+          return (
+            <Button key={`issue-${issue.number}`} plain onPress={press => void openUrl($, issue.url, press.surface)}>
+              <Text wrap="truncate-end">{`${row.head}${row.title}${pad}`}</Text>
+              {row.label && <Text dimColor>{row.label}</Text>}
+              {row.label && row.age ? ' ' : ''}
+              {row.age}
+            </Button>
+          )
+        },
+      })
+    }
+
+    if (tab === 'prs' && prSource.kind === 'ready') {
+      return githubBody({
+        tab: 'prs',
+        items: knownPrs?.prs ?? [],
+        error: knownPrs?.error,
+        isLoaded: knownPrs?.isLoaded ?? false,
+        readingText: 'Reading pull requests…',
+        emptyText: '✔ No open pull requests',
+        moreUrl: `https://github.com/${prSource.target}/pulls`,
+        updatedAt: knownPrs?.updatedAt ?? now.updatedAt,
+        row: (pr, at) => {
+          const row = fitPrRow(pr, width, ageOf(pr.updatedAt, at))
+          const tail = 1 + (row.age ? row.age.length + 1 : 0) // the mark, then a space and the age
+          const pad = ' '.repeat(Math.max(1, width - row.head.length - widthOf(row.title) - tail))
+          const isMine = me !== undefined && pr.author === me
+          const mark =
+            pr.mark === 'D' ? <Text dimColor>D</Text> : pr.mark ? <Text color={MARK_COLOR[pr.mark]}>{pr.mark}</Text> : ' '
+          return (
+            <Button key={`pr-${pr.number}`} plain onPress={press => void openUrl($, pr.url, press.surface)}>
+              <Text bold={isMine}>{row.head}</Text>
+              <Text wrap="truncate-end">{`${row.title}${pad}`}</Text>
+              {mark}
+              {row.age ? ` ${row.age}` : ''}
+            </Button>
+          )
+        },
+      })
     }
 
     const added = now.files.reduce((sum, file) => sum + (file.added ?? 0), 0)

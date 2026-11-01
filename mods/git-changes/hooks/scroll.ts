@@ -65,3 +65,15 @@ export function wrapMove(previous: number, next: number | 'before' | 'after', wi
   if (previous === window.start && next === 'before' && window.above > 0) return -1
   return 0
 }
+
+/**
+ * Where the focus ring landed, for `wrapMove`, on the Issues or PRs list:
+ * any tab button is `before` the list (they all sit above it), the more row
+ * `after`, a row its index in `numbers`, and anything else -1.
+ */
+export function arrivalOf(element: string | undefined, list: 'issues' | 'prs', numbers: readonly number[]): number | 'before' | 'after' {
+  if (element?.startsWith('tab-')) return 'before'
+  if (element === `${list}-more`) return 'after'
+  const number = new RegExp(`^${list === 'prs' ? 'pr' : 'issue'}-(\\d+)$`).exec(element ?? '')?.[1]
+  return number === undefined ? -1 : numbers.indexOf(Number(number))
+}

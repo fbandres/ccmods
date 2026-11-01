@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import type { Engine, EngineMount } from 'claude-code/testing'
 import { expect, mock, test } from 'claude-code/testing'
-import type { IssuesState } from '../types'
+import type { IssuesState, PrsState } from '../types'
 
 declare function setTimeout(fn: (value?: unknown) => void, ms: number): unknown // the test runtime has it; the mod's lib does not declare it
 
@@ -73,6 +73,16 @@ type Gh = {
   listError?: string
   /** When set, `gh issue list` waits for it before answering. */
   listGate?: Promise<void>
+  /** `gh pr list` JSON; default `[]`. */
+  prs?: string
+  /** `gh pr list` fails with this stderr (exit `prsExit`, default 1). */
+  prsError?: string
+  prsExit?: number
+  /** When set, `gh pr list` waits for it before answering. */
+  prsGate?: Promise<void>
+  /** `gh api user --jq .login`; default `fbandres`. */
+  login?: string
+  apiError?: boolean
 }
 
 const ORIGIN = 'https://github.com/fbandres/oscp-app.git'
@@ -105,6 +115,12 @@ async function answerGh(gh: Gh | undefined, argv: readonly string[]) {
     if (gh.repo === 'hang') return { deny: 'gh is still running after 30000 ms' }
     return ran(0, '{"name":"oscp-app-issues"}', '')
   }
+  if (argv[1] === 'pr') {
+    if (gh.prsGate) await gh.prsGate
+    if (gh.loggedOut) return ran(4, '', loggedOutText)
+    return gh.prsError ? ran(gh.prsExit ?? 1, '', gh.prsError) : ran(0, gh.prs ?? '[]', '')
+  }
+  if (argv[1] === 'api') return gh.apiError ? ran(1, '', 'HTTP 401: Bad credentials') : ran(0, `${gh.login ?? 'fbandres'}\n`, '')
   if (argv[1] === 'issue' && gh.listGate) await gh.listGate
   if (argv[1] === 'issue') return gh.listError ? ran(1, '', gh.listError) : ran(0, gh.list ?? '[]', '')
   return ran(1, '', 'unknown gh command')
@@ -642,7 +658,7 @@ test('issues refresh every 60s only while placed', async ($, on) => {
 })
 
 test('store issues=false skips detection entirely', async ($, on) => {
-  mock.store(on, { issues: false })
+  mock.store(on, { issues: false, prs: false })
   const clock = mock.clock(on)
   fakePanes(on)
   const issues = watchIssues(on)
@@ -908,7 +924,7 @@ test('/changes ISSUES with spaces works; other arguments get the usage line', as
   await startSession($, on)
 
   expect((await runArgs($, '  ISSUES ')).text).toBe('Issues tab hidden.')
-  expect((await runArgs($, 'foo')).text).toBe('Usage: /changes [issues]')
+  expect((await runArgs($, 'foo')).text).toBe('Usage: /changes [issues|prs]')
 })
 
 test('/git-changes issues works the same', async ($, on) => {
@@ -922,7 +938,7 @@ test('/git-changes issues works the same', async ($, on) => {
   await startSession($, on)
 
   expect((await runArgs($, 'issues', 'git-changes')).text).toBe('Issues tab hidden.')
-  expect((await runArgs($, 'nope', 'git-changes')).text).toBe('Usage: /git-changes [issues]')
+  expect((await runArgs($, 'nope', 'git-changes')).text).toBe('Usage: /git-changes [issues|prs]')
 })
 
 test('a pane drawn before detection finishes gains the tab bar when issues arrive', async ($, on) => {
@@ -1076,4 +1092,313 @@ test('a non-interactive start (claude -p, the SDK) never calls gh', async ($, on
   await settle()
 
   expect(calls.argv.filter(argv => argv[0] === 'gh')).toHaveLength(0)
+})
+
+// ── Pull requests ──────────────────────────────────────────────────────────
+
+const CODE_REPO = 'fbandres/oscp-app'
+const PR_LIST = [
+  'gh', 'pr', 'list', '-R', CODE_REPO, '--state', 'open', '--limit', '100',
+  '--json', 'number,title,isDraft,reviewDecision,statusCheckRollup,author,updatedAt,url',
+]
+
+type PrSpec = Partial<{ number: number; title: string; isDraft: boolean; reviewDecision: string; checks: unknown[]; login: string; updatedAt: string }>
+
+/** PRs as gh prints them; numbers count down from the list's length unless given. */
+function prsJson(specs: PrSpec[]) {
+  return JSON.stringify(
+    specs.map((spec, i) => {
+      const number = spec.number ?? specs.length - i
+      return {
+        number,
+        title: spec.title ?? `Pull request ${number}`,
+        isDraft: spec.isDraft ?? false,
+        reviewDecision: spec.reviewDecision ?? '',
+        statusCheckRollup: spec.checks ?? [],
+        author: { login: spec.login ?? 'alice' },
+        updatedAt: spec.updatedAt ?? `2026-10-${String(30 - i).padStart(2, '0')}T10:00:00Z`,
+        url: `https://github.com/${CODE_REPO}/pull/${number}`,
+      }
+    }),
+  )
+}
+
+/** The PRs value the plugin last wrote. */
+function watchPrs(on: On) {
+  const seen = { value: null as PrsState | null }
+  on('state.set', async (_$, e, next) => {
+    if ((e as { key?: string }).key === 'prs') seen.value = (e as { value: PrsState | null }).value
+    return next(e)
+  })
+  return seen
+}
+
+test('PRs are fetched after start with the agreed argv', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  const calls = fakeGit(on, () => ({ gh: { prs: prsJson([{}, {}]) } }))
+
+  await startSession($, on)
+  expect(ghRuns(calls, 'pr')[0]).toEqual(PR_LIST)
+  expect(prs.value?.prs.map(pr => pr.number)).toEqual([2, 1])
+  expect(prs.value?.isLoaded).toBe(true)
+  expect(prs.value?.isCapped).toBe(false)
+})
+
+test('the PR fetch never delays the pane', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  const panes = fakePanes(on)
+  const gate = held()
+  const calls = fakeGit(on, () => ({ gh: { prsGate: gate.promise } }))
+
+  await startSession($, on)
+  expect(panes.isOpen).toBe(true)
+  expect(calls.status).toBeGreaterThan(0)
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /^package\-lock\.json$/ })).toBeDefined()
+  gate.release()
+  await settle()
+})
+
+for (const [name, git] of [
+  ['a logged-out gh', { gh: { loggedOut: true } }],
+  ['a missing gh', {}],
+  ['a non-GitHub origin', { origin: 'https://gitlab.com/fbandres/oscp-app.git', gh: {} }],
+  ['an unknown repo', { gh: { prsError: "GraphQL: Could not resolve to a Repository with the name 'fbandres/oscp-app'. (repository)" } }],
+] as const) {
+  test(`${name} never shows a PRs tab and never retries`, async ($, on) => {
+    mock.store(on)
+    const clock = mock.clock(on)
+    fakePanes(on)
+    const prs = watchPrs(on)
+    const calls = fakeGit(on, () => git as Git)
+
+    await startSession($, on)
+    const before = ghRuns(calls, 'pr').length
+    expect(before).toBeLessThanOrEqual(1)
+    await clock.advance(60_000)
+    await settle()
+    expect(ghRuns(calls, 'pr')).toHaveLength(before)
+    expect(prs.value).toBeNull()
+  })
+}
+
+test('a first fetch that fails temporarily keeps retrying', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  let gh: Gh = { prsError: 'error connecting to api.github.com\nmore' }
+  fakeGit(on, () => ({ gh }))
+
+  await startSession($, on)
+  expect(prs.value?.error).toBe('GitHub: error connecting to api.github.com')
+  expect(prs.value?.isLoaded).toBe(false)
+
+  gh = { prs: prsJson([{}]) }
+  await clock.advance(60_000)
+  await settle()
+  expect(prs.value?.error).toBeUndefined()
+  expect(prs.value?.isLoaded).toBe(true)
+  expect(prs.value?.prs).toHaveLength(1)
+})
+
+test('a PR fetch failure after success keeps the last list', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  let gh: Gh = { prs: prsJson([{}, {}]) }
+  fakeGit(on, () => ({ gh }))
+
+  await startSession($, on)
+  gh = { prsError: 'HTTP 502: Bad Gateway' }
+  await clock.advance(60_000)
+  await settle()
+  expect(prs.value?.prs).toHaveLength(2)
+  expect(prs.value?.isLoaded).toBe(true)
+  expect(prs.value?.error).toBe('GitHub: HTTP 502: Bad Gateway')
+})
+
+test('a logged-out gh after success is an error line, not a lost tab', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  let gh: Gh = { prs: prsJson([{}]) }
+  fakeGit(on, () => ({ gh }))
+
+  await startSession($, on)
+  gh = { loggedOut: true }
+  await clock.advance(60_000)
+  await settle()
+  expect(prs.value?.prs).toHaveLength(1)
+  expect(prs.value?.error).toMatch(/^GitHub: /)
+})
+
+test('a PR reply that is not JSON says so', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  fakeGit(on, () => ({ gh: { prs: 'not json' } }))
+
+  await startSession($, on)
+  expect(prs.value?.error).toBe('GitHub: unexpected reply from gh')
+})
+
+test('100 PRs marks the list capped', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  fakeGit(on, () => ({ gh: { prs: prsJson(Array.from({ length: 100 }, () => ({}))) } }))
+
+  await startSession($, on)
+  expect(prs.value?.isCapped).toBe(true)
+})
+
+test('PRs refresh every 60s only while placed', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  const placed = fakePanes(on)
+  const calls = fakeGit(on, () => ({ gh: {} }))
+
+  await startSession($, on)
+  expect(ghRuns(calls, 'pr')).toHaveLength(1)
+  await clock.advance(30_000)
+  await settle()
+  expect(ghRuns(calls, 'pr')).toHaveLength(1)
+  await clock.advance(30_000)
+  await settle()
+  expect(ghRuns(calls, 'pr')).toHaveLength(2)
+
+  placed.value = false
+  await clock.advance(120_000)
+  await settle()
+  expect(ghRuns(calls, 'pr')).toHaveLength(2)
+})
+
+test('store prs=false never calls gh pr', async ($, on) => {
+  mock.store(on, { prs: false })
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const calls = fakeGit(on, () => ({ gh: {} }))
+
+  await startSession($, on)
+  await clock.advance(60_000)
+  await settle()
+  expect(ghRuns(calls, 'pr')).toHaveLength(0)
+})
+
+test('a non-interactive start never calls gh pr', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const calls = fakeGit(on, () => ({ gh: {} }))
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: false })
+  await settle()
+  expect(ghRuns(calls, 'pr')).toHaveLength(0)
+})
+
+test('the login is read once per session', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const calls = fakeGit(on, () => ({ gh: {} }))
+
+  await startSession($, on)
+  await clock.advance(120_000)
+  await settle()
+  expect(ghRuns(calls, 'api')).toEqual([['gh', 'api', 'user', '--jq', '.login']])
+})
+
+test('/changes prs hides the tab and remembers it, then shows it again', async ($, on) => {
+  const store = fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  fakeGit(on, () => ({ gh: { prs: prsJson([{}]) } }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'prs')).text).toBe('PRs tab hidden.')
+  expect(store.prs).toBe(false)
+  expect(prs.value).toBeNull()
+
+  expect((await runArgs($, 'prs')).text).toBe('PRs tab shown.')
+  expect(store.prs).toBe(true)
+  expect(prs.value?.prs).toHaveLength(1)
+})
+
+for (const [why, git, reply] of [
+  ['a non-GitHub origin', { origin: 'https://gitlab.com/fbandres/oscp-app.git', gh: {} }, 'origin is not a GitHub repo'],
+  ['an unknown repo', { gh: { prsError: 'HTTP 404: Not Found' } }, `${CODE_REPO} not found or no access`],
+  ['no gh', {}, 'gh is not installed'],
+  ['a logged-out gh', { gh: { loggedOut: true } }, 'gh is not logged in (run: gh auth login)'],
+] as const) {
+  test(`turning PRs on with ${why} says why there is no tab`, async ($, on) => {
+    fakeStore(on, { prs: false })
+    mock.clock(on)
+    fakePanes(on)
+    fakeGit(on, () => git as Git)
+    await startSession($, on)
+
+    expect((await runArgs($, 'prs')).text).toBe(`PRs tab on, but it can't be shown: ${reply}.`)
+  })
+}
+
+test('turning PRs on while GitHub is down says it retries', async ($, on) => {
+  fakeStore(on, { prs: false })
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { prsError: 'error connecting to api.github.com' } }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'prs')).text).toBe('PRs tab on; GitHub is unreachable right now, retrying every minute.')
+})
+
+test('turning PRs off during the first fetch keeps them off', async ($, on) => {
+  fakeStore(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  const gate = held()
+  const calls = fakeGit(on, () => ({ gh: { prsGate: gate.promise, prs: prsJson([{}]) } }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'prs')).text).toBe('PRs tab hidden.')
+  gate.release()
+  await settle()
+  expect(prs.value).toBeNull()
+  await clock.advance(60_000)
+  await settle()
+  expect(ghRuns(calls, 'pr')).toHaveLength(1)
+})
+
+test('/changes PRS with spaces works; the usage line lists both', async ($, on) => {
+  fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: {} }))
+  await startSession($, on)
+
+  expect((await runArgs($, '  PRS ')).text).toBe('PRs tab hidden.')
+  expect((await runArgs($, 'foo')).text).toBe('Usage: /changes [issues|prs]')
+})
+
+test('/git-changes prs works the same', async ($, on) => {
+  fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: {} }))
+  on('command.register', async (_$, e) =>
+    e.name === 'changes' ? { deny: 'a built-in has this name' } : { value: { command: e.name } },
+  )
+  await startSession($, on)
+
+  expect((await runArgs($, 'prs', 'git-changes')).text).toBe('PRs tab hidden.')
 })

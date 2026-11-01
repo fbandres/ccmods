@@ -1,8 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register } from 'claude-code'
 
-import type { FileChange, IssuesState, RepoStatus } from '../types'
+import type { FileChange, IssuesState, PrsState, RepoStatus } from '../types'
 import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
+import { parsePrs, PRS_LIMIT, prsRepoOf } from './prs'
 import type { LineStat } from './status'
 import { ageOf, fitIssueRow } from './issues'
 import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
@@ -31,6 +32,7 @@ const MAX_COUNTED_BYTES = 256 * 1024
 
 const status = atom({ plugin: 'git-changes', key: 'status' } as const, null as RepoStatus | null)
 const issues = atom({ plugin: 'git-changes', key: 'issues' } as const, null as IssuesState | null)
+const prs = atom({ plugin: 'git-changes', key: 'prs' } as const, null as PrsState | null)
 
 /** Where the `<repo>-issues` lookup stands: `none` and `off` are final for the session, `retrying` is not. */
 type Detection = { kind: 'off' } | { kind: 'none'; reason: string } | { kind: 'retrying' } | { kind: 'detected'; target: string }
@@ -39,6 +41,19 @@ let issuesTimer: { cancel: () => void } | undefined
 let isFetching = false
 let fetchQueued = false // a tab press asked while a fetch ran: fetch once more after it
 let lastIssuesRaw: string | undefined
+
+/**
+ * Where the PR list stands: `pending` until the first `gh pr list` answers (no
+ * tab yet), then `ready`; `none` and `off` are final for the session.
+ */
+type PrSource = { kind: 'off' } | { kind: 'none'; reason: string } | { kind: 'pending'; target: string } | { kind: 'ready'; target: string }
+let prSource: PrSource = { kind: 'off' }
+let me: string | undefined // gh's login: these PRs' numbers draw bold
+let isFetchingPrs = false
+let prsQueued = false // a tab press asked while a fetch ran: fetch once more after it
+let lastPrsRaw: string | undefined
+/** Bumped by every lookup and by turning PRs off: a slower, older answer is then dropped. */
+let prsRun = 0
 
 type Tab = TabId
 let tab: Tab = 'changes'
@@ -292,7 +307,7 @@ function startTimer($: Engine) {
   timer?.cancel()
   timer = $.clock.every(INTERVAL_MS, () => void tick($))
   issuesTimer?.cancel()
-  issuesTimer = $.clock.every(ISSUES_INTERVAL_MS, () => void issuesTick($).catch(() => {}))
+  issuesTimer = $.clock.every(ISSUES_INTERVAL_MS, () => void githubTick($).catch(() => {}))
 }
 
 function stopTimers() {
@@ -302,8 +317,9 @@ function stopTimers() {
   issuesTimer = undefined
 }
 
-async function issuesTick($: Engine) {
+async function githubTick($: Engine) {
   if (!(await isPlaced($))) return
+  if (prSource.kind === 'ready') void fetchPrs($).catch(() => {})
   if (detection.kind === 'retrying') await detectIssues($)
   else if (detection.kind === 'detected') await fetchIssues($)
 }
@@ -401,6 +417,113 @@ async function fetchIssues($: Engine, isUrgent = false): Promise<void> {
   }
 }
 
+/** Whether gh is on this machine, when running it rejected: a hang and a missing binary both reject. */
+function hasGh($: Engine) {
+  return $.process.run(['gh', '--version'], { timeoutMs: 5000 } as never).then(
+    () => true,
+    () => false,
+  )
+}
+
+/** Finds `<owner>/<repo>` from origin and fetches its PRs once (awaited); the login is read alongside. */
+async function findPrs($: Engine) {
+  const run = ++prsRun
+  if ((await $.store.get('prs')) === false) {
+    if (run === prsRun) prSource = { kind: 'off' }
+    return
+  }
+  const origin = await $.process.run(['git', 'remote', 'get-url', 'origin']).catch(() => undefined)
+  const target = origin?.exitCode === 0 ? prsRepoOf(origin.stdout) : undefined
+  if (run !== prsRun) return
+  if (!target) {
+    prSource = { kind: 'none', reason: 'origin is not a GitHub repo' }
+    return
+  }
+  prSource = { kind: 'pending', target }
+  if (me === undefined) void readLogin($)
+  await fetchPrs($)
+}
+
+let isLoginRead = false
+/** gh's login, once per session; a failure leaves nothing bold. */
+async function readLogin($: Engine) {
+  if (isLoginRead) return
+  isLoginRead = true
+  try {
+    const run = await $.process.run(['gh', 'api', 'user', '--jq', '.login'])
+    if (run.exitCode === 0) me = run.stdout.trim() || undefined
+  } catch {
+    // No login: nothing is bold.
+  }
+}
+
+/**
+ * Reads the open PRs. While `pending`, a definitive failure ends the lookup
+ * (no tab); anything else makes the source `ready`, a failure keeping the last
+ * list and setting `error`.
+ */
+async function fetchPrs($: Engine, isUrgent = false): Promise<void> {
+  if (prSource.kind !== 'pending' && prSource.kind !== 'ready') return
+  if (isFetchingPrs) {
+    if (isUrgent) prsQueued = true
+    return
+  }
+  isFetchingPrs = true
+  const run = prsRun
+  const { target } = prSource
+  const isCurrent = () => run === prsRun
+  const ready = () => {
+    prSource = { kind: 'ready', target }
+  }
+  const failed = async (error: string) => {
+    lastPrsRaw = undefined
+    ready()
+    await update($, prs, now => ({ ...(now ?? { prs: [], isLoaded: false, isCapped: false, updatedAt: Date.now() }), error }))
+  }
+  try {
+    let answer: { exitCode: number; stdout: string; stderr: string }
+    try {
+      answer = await $.process.run([
+        'gh', 'pr', 'list', '-R', target, '--state', 'open', '--limit', String(PRS_LIMIT),
+        '--json', 'number,title,isDraft,reviewDecision,statusCheckRollup,author,updatedAt,url',
+      ])
+    } catch {
+      const isInstalled = await hasGh($)
+      if (!isCurrent()) return
+      if (!isInstalled && prSource.kind === 'pending') prSource = { kind: 'none', reason: 'gh is not installed' }
+      else await failed('GitHub: gh could not be run')
+      return
+    }
+    if (!isCurrent()) return
+    if (answer.exitCode !== 0) {
+      const failure = answer.exitCode === 4 ? 'logged-out' : classifyGhFailure(answer.stderr)
+      if (prSource.kind === 'pending' && failure === 'logged-out') prSource = { kind: 'none', reason: 'gh is not logged in (run: gh auth login)' }
+      else if (prSource.kind === 'pending' && failure === 'not-found') prSource = { kind: 'none', reason: `${target} not found or no access` }
+      else await failed(`GitHub: ${firstLine(answer.stderr)}`)
+      return
+    }
+    ready()
+    if (answer.stdout === lastPrsRaw && (await read($, prs)) !== null) return
+    let list: ReturnType<typeof parsePrs>
+    try {
+      list = parsePrs(answer.stdout)
+    } catch {
+      await failed('GitHub: unexpected reply from gh')
+      return
+    }
+    lastPrsRaw = answer.stdout
+    await update($, prs, () => ({ prs: list, isLoaded: true, isCapped: list.length >= PRS_LIMIT, updatedAt: Date.now() }))
+  } catch {
+    if (isCurrent()) await failed('GitHub: gh could not be run').catch(() => {})
+  } finally {
+    isFetchingPrs = false
+    if (prsQueued) {
+      prsQueued = false
+      void fetchPrs($).catch(() => {})
+    }
+  }
+}
+
 async function show($: Engine) {
   startTimer($)
   lastRaw = undefined // reopening always redraws from a fresh read
@@ -448,12 +571,35 @@ async function toggleIssues($: Engine) {
   return { text: 'Issues tab shown.' }
 }
 
-/** What `/changes <args>` does: no args toggles the pane, `issues` the Issues tab. */
+/** `/changes prs`: the PRs tab off or on, remembered on this machine. */
+async function togglePrs($: Engine) {
+  const isOn = (await $.store.get('prs')) === false
+  await $.store.set('prs', isOn)
+  if (!isOn) {
+    prsRun++ // a lookup or fetch still running drops its answer
+    prSource = { kind: 'off' }
+    if (tab === 'prs') tab = 'changes'
+    lastPrsRaw = undefined
+    await update($, prs, () => null)
+    await update($, status, now => now && { ...now }) // draws without the tab
+    return { text: 'PRs tab hidden.' }
+  }
+  await findPrs($)
+  await update($, status, now => now && { ...now })
+  const found: PrSource = prSource
+  if (found.kind === 'none') return { text: `PRs tab on, but it can't be shown: ${found.reason}.` }
+  const error = found.kind === 'ready' ? (await read($, prs))?.error : undefined
+  if (error) return { text: 'PRs tab on; GitHub is unreachable right now, retrying every minute.' }
+  return { text: 'PRs tab shown.' }
+}
+
+/** What `/changes <args>` does: no args toggles the pane, `issues` and `prs` their tabs. */
 async function runCommand($: Engine, args: string) {
   const word = args.trim().toLowerCase()
   if (word === '') return toggle($)
   if (word === 'issues') return toggleIssues($)
-  return { text: `Usage: /${commandName} [issues]` }
+  if (word === 'prs') return togglePrs($)
+  return { text: `Usage: /${commandName} [issues|prs]` }
 }
 
 async function hide($: Engine) {
@@ -466,7 +612,11 @@ export const register: Register = on => {
     await registerCommand($)
     const isGit = await isRepo($)
     if (isGit && (await $.store.get('shown')) !== false) await showOnStart($)
-    if (isGit && e.isInteractive) void detectIssues($).catch(() => {}) // GitHub never holds the session; -p and the SDK skip it
+    if (isGit && e.isInteractive) {
+      // GitHub never holds the session; -p and the SDK skip it
+      void detectIssues($).catch(() => {})
+      void findPrs($).catch(() => {})
+    }
     void syncEditorTheme($).catch(() => {}) // the pane's fill follows the editor; never holds the session
 
     return next(e)

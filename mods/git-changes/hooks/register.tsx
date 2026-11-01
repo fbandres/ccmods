@@ -6,7 +6,7 @@ import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './is
 import { fitPrRow, MARK_COLOR, parsePrs, PRS_LIMIT, prsRepoOf, worstMark } from './prs'
 import type { LineStat } from './status'
 import { ageOf, fitIssueRow } from './issues'
-import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
+import { arrivalOf, followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
 import type { TabId } from './tabs'
 import { tabTexts } from './tabs'
@@ -50,6 +50,7 @@ type PrSource = { kind: 'off' } | { kind: 'none'; reason: string } | { kind: 'pe
 let prSource: PrSource = { kind: 'off' }
 let me: string | undefined // gh's login: these PRs' numbers draw bold
 let isFetchingPrs = false
+let prsInFlight: Promise<void> | undefined // the running fetch, for a new lookup to wait out
 let prsQueued = false // a tab press asked while a fetch ran: fetch once more after it
 let lastPrsRaw: string | undefined
 /** Bumped by every lookup and by turning PRs off: a slower, older answer is then dropped. */
@@ -441,6 +442,8 @@ async function findPrs($: Engine) {
   }
   prSource = { kind: 'pending', target }
   if (me === undefined) void readLogin($)
+  await prsInFlight?.catch(() => {}) // an older fetch still running would turn this one away
+  if (run !== prsRun) return
   await fetchPrs($)
 }
 
@@ -469,8 +472,14 @@ async function fetchPrs($: Engine, isUrgent = false): Promise<void> {
     return
   }
   isFetchingPrs = true
+  const running = fetchPrsOnce($, prSource.target)
+  prsInFlight = running
+  return running
+}
+
+/** One `gh pr list` for `target`; the caller has set `isFetchingPrs`, and the `finally` clears it. */
+async function fetchPrsOnce($: Engine, target: string): Promise<void> {
   const run = prsRun
-  const { target } = prSource
   const isCurrent = () => run === prsRun
   const ready = () => {
     prSource = { kind: 'ready', target }
@@ -668,7 +677,7 @@ export const register: Register = on => {
     const numbers = isPrs ? ((await read($, prs))?.prs ?? []).map(pr => pr.number) : ((await read($, issues))?.issues ?? []).map(issue => issue.number)
     const indexOf = (number: number | undefined) => numbers.indexOf(number ?? Number.NaN)
     const number = new RegExp(`^${prefix}(\\d+)$`).exec(e.element ?? '')?.[1]
-    const arrived = e.element === `${list}-more` ? 'after' : e.element === `tab-${list}` ? 'before' : indexOf(Number(number))
+    const arrived = arrivalOf(e.element, list, numbers)
     const previous = indexOf(focusedRow)
     const window = windowOf(numbers.length, offsets[list], drawn[list].room)
     const move = e.origin.kind === 'person' ? wrapMove(previous, arrived, window) : 0

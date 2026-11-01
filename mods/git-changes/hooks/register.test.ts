@@ -1663,3 +1663,22 @@ test('a narrow pane keeps three tabs on one row and every PR mark visible', asyn
   expect(tabs.map(text => text.length).reduce((a, b) => a + b, 0) + 2).toBeLessThanOrEqual(24)
   expect(await pane.find({ text: /^✓$/ })).toBeDefined()
 })
+
+test('turning PRs off and on while a fetch runs still brings the tab back', async ($, on) => {
+  fakeStore(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  const prs = watchPrs(on)
+  const gate = held()
+  fakeGit(on, () => ({ gh: { prsGate: gate.promise, prs: prsJson([{}]) } }))
+  await startSession($, on)
+
+  expect((await runArgs($, 'prs')).text).toBe('PRs tab hidden.')
+  const turnedOn = runArgs($, 'prs')
+  await settle()
+  gate.release()
+  expect((await turnedOn).text).toBe('PRs tab shown.')
+  await clock.advance(60_000)
+  await settle()
+  expect(prs.value?.prs).toHaveLength(1)
+})

@@ -25,7 +25,7 @@ Or install it yourself, inside Claude Code:
 
 | Mod | What it does | Use |
 |---|---|---|
-| [git-changes](mods/git-changes/README.md) | Live Source Control pane: changed files, status letters, +/− line counts | `/changes` |
+| [git-changes](mods/git-changes/README.md) | Live Source Control pane: changed files with +/− line counts, open pull requests and GitHub issues | `/changes` |
 | [wpm-gauge](mods/wpm-gauge/README.md) | Words-per-minute gauge (5 coloured bars, streak peak, ⚡ at full speed) under the prompt box | always on |
 
 ## Requirements

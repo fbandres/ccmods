@@ -1036,7 +1036,7 @@ test('an issue row with no label or age never runs past a narrow pane', async ($
 })
 
 test('a narrow pane keeps the tab bar on one row with short names', async ($, on) => {
-  mock.store(on)
+  mock.store(on, { prs: false })
   mock.clock(on)
   fakePanes(on)
   fakeGit(on, () => ({ gh: { list: issuesJson(100) } }))
@@ -1401,4 +1401,265 @@ test('/git-changes prs works the same', async ($, on) => {
   await startSession($, on)
 
   expect((await runArgs($, 'prs', 'git-changes')).text).toBe('PRs tab hidden.')
+})
+
+// ── The PRs tab ────────────────────────────────────────────────────────────
+
+const failing = [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'FAILURE' }]
+const passing = [{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }]
+const running = [{ __typename: 'CheckRun', status: 'IN_PROGRESS', conclusion: null }]
+
+/** Starts a session, mounts the pane and opens the PRs tab. */
+async function openPrsTab($: Engine, on: On, gh: Gh, bodyRows = 20, bodyColumns = 50) {
+  await startSession($, on)
+  const pane = await mountPane($.ui, 'terminal', bodyRows, bodyColumns)
+  await pane.press({ key: 'tab-prs' })
+  await settle()
+  await pane.redraw()
+  return pane
+}
+
+test('a GitHub repo with no issues repo shows Changes and PRs tabs', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { repo: 'missing', prs: prsJson([{}, {}, {}]) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /^\[Changes 2\]$/ })).toBeDefined()
+  expect(await pane.find({ text: /^ PRs 3 $/ })).toBeDefined()
+  expect(await pane.find({ key: 'tab-issues' })).toBeUndefined()
+  expect(await pane.find({ text: /CHANGES/ })).toBeUndefined()
+})
+
+test('a pane drawn while the first PR fetch runs has no tab bar yet', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gate = held()
+  fakeGit(on, () => ({ gh: { repo: 'missing', prsGate: gate.promise } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ key: 'tab-prs' })).toBeUndefined()
+  expect(await pane.find({ text: /CHANGES/ })).toBeDefined()
+  gate.release()
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ key: 'tab-prs' })).toBeDefined()
+})
+
+test('three tabs in order: Changes, Issues, PRs', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { list: issuesJson(5), prs: prsJson([{}, {}, {}]) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  const texts = await Promise.all(['tab-changes', 'tab-issues', 'tab-prs'].map(async key => (await pane.find({ key }))?.text))
+  expect(texts).toEqual(['[Changes 2]', ' Issues 5 ', ' PRs 3 '])
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn.indexOf('tab-changes')).toBeLessThan(drawn.indexOf('tab-issues'))
+  expect(drawn.indexOf('tab-issues')).toBeLessThan(drawn.indexOf('tab-prs'))
+})
+
+test('pressing the PRs tab fetches at once and lists PRs newest first', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const calls = fakeGit(on, () => ({
+    gh: { prs: prsJson([{ number: 4, updatedAt: '2026-10-01T10:00:00Z' }, { number: 12, title: 'Add dark theme', updatedAt: '2026-10-31T10:00:00Z' }]) },
+  }))
+  await startSession($, on)
+  const before = ghRuns(calls, 'pr').length
+
+  const pane = await mountPane($.ui, 'terminal', 20, 50)
+  await pane.press({ key: 'tab-prs' })
+  await settle()
+  await pane.redraw()
+  expect(ghRuns(calls, 'pr').length).toBe(before + 1)
+  expect(await pane.find({ text: /^\[PRs 2\]$/ })).toBeDefined()
+  const drawn = JSON.stringify(await pane.drawn())
+  expect(drawn.indexOf('pr-12')).toBeGreaterThan(-1)
+  expect(drawn.indexOf('pr-12')).toBeLessThan(drawn.indexOf('pr-4'))
+  expect(await pane.find({ text: /Add dark theme/ })).toBeDefined()
+  expect(await pane.find({ text: /^package\-lock\.json$/ })).toBeUndefined()
+})
+
+test('marks are drawn and coloured', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = {
+    prs: prsJson([
+      { number: 6, isDraft: true, checks: failing },
+      { number: 5, checks: failing },
+      { number: 4, reviewDecision: 'CHANGES_REQUESTED', checks: passing },
+      { number: 3, checks: running },
+      { number: 2, checks: passing },
+      { number: 1 },
+    ]),
+  }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  const mark = async (text: string) => pane.find({ text: new RegExp(`^${text}$`) })
+  expect((await mark('D'))?.props.dimColor).toBe(true)
+  expect((await mark('✗'))?.props.color).toBe('error')
+  expect((await mark('R'))?.props.color).toBe('merged')
+  expect((await mark('●'))?.props.color).toBe('warning')
+  expect((await mark('✓'))?.props.color).toBe('success')
+})
+
+for (const [name, specs, color] of [
+  ['red when a ready PR fails', [{ checks: failing }, { reviewDecision: 'CHANGES_REQUESTED' }], 'error'],
+  ['magenta for changes requested', [{ checks: passing }, { reviewDecision: 'CHANGES_REQUESTED' }], 'merged'],
+  ['plain for a failing draft only', [{ isDraft: true, checks: failing }, { checks: passing }], undefined],
+] as const) {
+  test(`the PRs count is ${name}`, async ($, on) => {
+    mock.store(on)
+    mock.clock(on)
+    fakePanes(on)
+    fakeGit(on, () => ({ gh: { prs: prsJson(specs as unknown as PrSpec[]) } }))
+    await startSession($, on)
+
+    const pane = await mountPane($.ui, 'terminal')
+    // Changes reads 2 as well; the PRs count is the one that may carry a colour.
+    const counts = await pane.findAll({ text: /^2$/ })
+    expect(counts.length).toBeGreaterThanOrEqual(2)
+    if (color) expect(counts.map(node => node.props.color)).toContain(color)
+    else expect(counts.every(node => node.props.color === undefined)).toBe(true)
+  })
+}
+
+test('my PRs have a bold number', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { login: 'fbandres', prs: prsJson([{ number: 8, login: 'fbandres' }, { number: 7, login: 'alice' }]) }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  expect((await pane.find({ text: /^#8 $/ }))?.props.bold).toBe(true)
+  expect((await pane.find({ text: /^#7 $/ }))?.props.bold).toBeFalsy()
+})
+
+test('nothing is bold when the login cannot be read', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { apiError: true, prs: prsJson([{ number: 8, login: 'fbandres' }]) }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  expect((await pane.find({ text: /^#8 $/ }))?.props.bold).toBeFalsy()
+})
+
+test('0 PRs shows No open pull requests', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { prs: '[]' }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  expect(await pane.find({ text: /^\[PRs 0\]$/ })).toBeDefined()
+  expect(await pane.find({ text: /✔ No open pull requests/ })).toBeDefined()
+})
+
+test('pressing a PR opens it', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { prs: prsJson([{}, {}]) }
+  const calls = fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  await pane.press({ key: 'pr-2' })
+  await settle()
+  expect(opened(calls)).toEqual([['xdg-open', `https://github.com/${CODE_REPO}/pull/2`]])
+})
+
+test('the more row under a long PR list opens /pulls', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { prs: prsJson(Array.from({ length: 30 }, () => ({}))) }
+  const calls = fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh, 12)
+
+  expect(await pane.find({ text: /↓ \d+ more/ })).toBeDefined()
+  await pane.press({ key: 'prs-more' })
+  await settle()
+  expect(opened(calls)).toEqual([['xdg-open', `https://github.com/${CODE_REPO}/pulls`]])
+})
+
+test('100 PRs reads PRs 100+', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  fakeGit(on, () => ({ gh: { prs: prsJson(Array.from({ length: 100 }, () => ({}))) } }))
+  await startSession($, on)
+
+  const pane = await mountPane($.ui, 'terminal')
+  expect(await pane.find({ text: /^ PRs 100\+ $/ })).toBeDefined()
+})
+
+test('turning PRs off while on the PRs tab returns to Changes', async ($, on) => {
+  fakeStore(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { repo: 'missing', prs: prsJson([{}]) }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  await runArgs($, 'prs')
+  await pane.redraw()
+  expect(await pane.find({ key: 'tab-prs' })).toBeUndefined()
+  expect(await pane.find({ text: /^package\-lock\.json$/ })).toBeDefined()
+})
+
+test('a PR fetch error keeps the PRs tab and its rows, with the error line', async ($, on) => {
+  mock.store(on)
+  const clock = mock.clock(on)
+  fakePanes(on)
+  let gh: Gh = { prs: prsJson([{ title: 'Still here' }]) }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  gh = { prsError: 'HTTP 502: Bad Gateway' }
+  await clock.advance(60_000)
+  await settle()
+  await pane.redraw()
+  expect(await pane.find({ key: 'tab-prs' })).toBeDefined()
+  expect(await pane.find({ text: /GitHub: HTTP 502/ })).toBeDefined()
+  expect(await pane.find({ text: /Still here/ })).toBeDefined()
+})
+
+test('a first temporary failure shows PRs … with the error', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { prsError: 'error connecting to api.github.com' }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh)
+
+  expect(await pane.find({ text: /^\[PRs …\]$/ })).toBeDefined()
+  expect(await pane.find({ text: /GitHub: error connecting/ })).toBeDefined()
+})
+
+test('a narrow pane keeps three tabs on one row and every PR mark visible', async ($, on) => {
+  mock.store(on)
+  mock.clock(on)
+  fakePanes(on)
+  const gh: Gh = { list: issuesJson(5), prs: prsJson([{ title: 'A very long pull request title that never fits', checks: passing }]) }
+  fakeGit(on, () => ({ gh }))
+  const pane = await openPrsTab($, on, gh, 20, 24)
+
+  const tabs = await Promise.all(['tab-changes', 'tab-issues', 'tab-prs'].map(async key => (await pane.find({ key }))?.text ?? ''))
+  expect(tabs.every(text => text.length > 0)).toBe(true)
+  expect(tabs.map(text => text.length).reduce((a, b) => a + b, 0) + 2).toBeLessThanOrEqual(24)
+  expect(await pane.find({ text: /^✓$/ })).toBeDefined()
 })

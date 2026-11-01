@@ -3,7 +3,7 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 
 import type { FileChange, IssuesState, PrsState, RepoStatus } from '../types'
 import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
-import { parsePrs, PRS_LIMIT, prsRepoOf } from './prs'
+import { fitPrRow, MARK_COLOR, parsePrs, PRS_LIMIT, prsRepoOf, worstMark } from './prs'
 import type { LineStat } from './status'
 import { ageOf, fitIssueRow } from './issues'
 import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
@@ -70,8 +70,8 @@ const drawn: Record<Tab, { length: number; room: number; top: number; bodyRows: 
   prs: { length: 0, room: 1, top: 0, bodyRows: 1 },
 }
 
-/** The number of the issue row the ring was last on; a number survives a fetch that re-sorts the list. */
-let focusedIssue: number | undefined
+/** The number of the issue or PR row the ring was last on; a number survives a fetch that re-sorts the list. */
+let focusedRow: number | undefined
 
 /** Opens `url` in the browser: xdg-open (Linux), then open (macOS), else copies it. */
 async function openUrl($: Engine, url: string, surface: unknown) {
@@ -555,7 +555,7 @@ async function toggleIssues($: Engine) {
   if (!isOn) {
     detectRun++ // a detection still running drops its answer
     detection = { kind: 'off' }
-    focusedIssue = undefined
+    focusedRow = undefined
     tab = 'changes'
     lastIssuesRaw = undefined
     await update($, issues, () => null)
@@ -658,31 +658,34 @@ export const register: Register = on => {
 
   // Arrows move the ring between drawn rows; past an edge with rows beyond it, the list follows.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
-    if (tab !== 'issues') {
-      focusedIssue = undefined
+    if (tab === 'changes') {
+      focusedRow = undefined
       return next(e)
     }
-    const items = (await read($, issues))?.issues ?? []
-    const indexOf = (number: number | undefined) => items.findIndex(issue => issue.number === number)
-    const number = /^issue-(\d+)$/.exec(e.element ?? '')?.[1]
-    const arrived = e.element === 'issues-more' ? 'after' : e.element === 'tab-issues' ? 'before' : indexOf(Number(number))
-    const previous = indexOf(focusedIssue)
-    const window = windowOf(items.length, offsets.issues, drawn.issues.room)
+    const list = tab
+    const isPrs = list === 'prs'
+    const prefix = isPrs ? 'pr-' : 'issue-'
+    const numbers = isPrs ? ((await read($, prs))?.prs ?? []).map(pr => pr.number) : ((await read($, issues))?.issues ?? []).map(issue => issue.number)
+    const indexOf = (number: number | undefined) => numbers.indexOf(number ?? Number.NaN)
+    const number = new RegExp(`^${prefix}(\\d+)$`).exec(e.element ?? '')?.[1]
+    const arrived = e.element === `${list}-more` ? 'after' : e.element === `tab-${list}` ? 'before' : indexOf(Number(number))
+    const previous = indexOf(focusedRow)
+    const window = windowOf(numbers.length, offsets[list], drawn[list].room)
     const move = e.origin.kind === 'person' ? wrapMove(previous, arrived, window) : 0
     if (move === 0) {
-      focusedIssue = number === undefined ? undefined : Number(number)
+      focusedRow = number === undefined ? undefined : Number(number)
       return next(e)
     }
-    const stay = items[previous]
-    const target = items[previous + move]
-    if (!stay || !target) return next(e)
-    offsets.issues = followed(offsets.issues, previous + move, items.length, drawn.issues.room)
-    focusedIssue = target.number
-    await update($, issues, now => now && { ...now }) // draws the new row
-    const key = `issue-${target.number}`
+    const stay = numbers[previous]
+    const target = numbers[previous + move]
+    if (stay === undefined || target === undefined) return next(e)
+    offsets[list] = followed(offsets[list], previous + move, numbers.length, drawn[list].room)
+    focusedRow = target
+    await update($, status, now => now && { ...now }) // draws the new row
+    const key = `${prefix}${target}`
     $.clock.after(REFOCUS_MS, () => void $.ui.focus({ requestId: PANE, key } as never).catch(() => {}))
 
-    return next({ ...e, element: `issue-${stay.number}` }) // the ring waits on the row it left
+    return next({ ...e, element: `${prefix}${stay}` }) // the ring waits on the row it left
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -690,11 +693,15 @@ export const register: Register = on => {
     const now = await read($, status)
     if (!now) return <Text dimColor>Reading git status…</Text>
 
-    // Read the issues every time: the read subscribes this pane, so a detection that lands later draws the tab bar.
+    // Read both lists every time: the read subscribes this pane, so a lookup that lands later draws the tab bar.
     const fetched = await read($, issues)
-    const hasTabs = detection.kind === 'detected'
-    if (!hasTabs) tab = 'changes'
-    const known = hasTabs ? fetched : null
+    const fetchedPrs = await read($, prs)
+    const hasIssues = detection.kind === 'detected'
+    const hasPrs = prSource.kind === 'ready'
+    const hasTabs = hasIssues || hasPrs
+    if ((tab === 'issues' && !hasIssues) || (tab === 'prs' && !hasPrs)) tab = 'changes'
+    const known = hasIssues ? fetched : null
+    const knownPrs = hasPrs ? fetchedPrs : null
     const width = Math.max(20, e.props.bodyColumns)
     const bodyRows = e.props.scroll.bodyRows
     const count = now.files.length
@@ -720,23 +727,36 @@ export const register: Register = on => {
     )
 
     const issuesCount = !known ? '…' : known.isCapped ? `${ISSUES_LIMIT}+` : String(known.issues.length)
-    const texts = tabTexts(width, { changes: String(count), issues: issuesCount }, tab)
-    const tabButton = (which: Tab, onPress: () => void, countColor?: string) => {
+    const prsCount = !knownPrs?.isLoaded ? '…' : knownPrs.isCapped ? `${PRS_LIMIT}+` : String(knownPrs.prs.length)
+    const worst = worstMark(knownPrs?.prs ?? [])
+    const texts = tabTexts(
+      width,
+      { changes: String(count), ...(hasIssues ? { issues: issuesCount } : {}), ...(hasPrs ? { prs: prsCount } : {}) },
+      tab,
+    )
+    const tabButton = (which: Tab, countColor?: string) => {
       const text = texts[which]
       if (!text) return null
-      const count = <Text color={countColor}>{text.count}</Text>
+      const onPress = () => {
+        tab = which
+        focusedRow = undefined
+        redraw()
+        if (which === 'issues') void fetchIssues($, true).catch(() => {})
+        if (which === 'prs') void fetchPrs($, true).catch(() => {})
+      }
+      const shown = <Text color={countColor}>{text.count}</Text>
       return (
         <Button key={`tab-${which}`} plain onPress={onPress}>
           {tab === which ? (
             <Text bold>
               {text.before}
-              {count}
+              {shown}
               {text.after}
             </Text>
           ) : (
             <Text dimColor>
               {text.before}
-              {count}
+              {shown}
               {text.after}
             </Text>
           )}
@@ -745,17 +765,9 @@ export const register: Register = on => {
     }
     const tabBar = hasTabs && (
       <Box gap={1}>
-        {tabButton('changes', () => {
-          tab = 'changes'
-          focusedIssue = undefined
-          redraw()
-        })}
-        {tabButton('issues', () => {
-          tab = 'issues'
-          focusedIssue = undefined
-          redraw()
-          void fetchIssues($, true).catch(() => {})
-        })}
+        {tabButton('changes')}
+        {tabButton('issues')}
+        {tabButton('prs', worst === '✗' ? 'error' : worst === 'R' ? MARK_COLOR.R : undefined)}
       </Box>
     )
     const footer = (at: number) => (
@@ -764,14 +776,23 @@ export const register: Register = on => {
       </Text>
     )
 
-    if (tab === 'issues' && detection.kind === 'detected') {
-      const items = known?.issues ?? []
-      const above = 3 + (known?.error ? 1 : 0) // branch, tabs, divider; error
+    /** The Issues and PRs tabs' body: error, reading or empty line, the scrolled rows, the more button. */
+    const githubBody = <T,>(list: {
+      tab: 'issues' | 'prs'
+      items: readonly T[]
+      error?: string
+      isLoaded: boolean
+      readingText: string
+      emptyText: string
+      moreUrl: string
+      updatedAt: number
+      row: (item: T, at: number) => unknown
+    }) => {
+      const above = 3 + (list.error ? 1 : 0) // branch, tabs, divider; error
       const room = listRoom(bodyRows, above + 2) // + divider, footer
-      const window = windowOf(items.length, offsets.issues, room)
-      offsets.issues = window.start
-      Object.assign(drawn.issues, { length: items.length, room, top: above, bodyRows })
-      const listUrl = `https://github.com/${detection.target}/issues`
+      const window = windowOf(list.items.length, offsets[list.tab], room)
+      offsets[list.tab] = window.start
+      Object.assign(drawn[list.tab], { length: list.items.length, room, top: above, bodyRows })
       const at = Date.now()
 
       return (
@@ -779,36 +800,79 @@ export const register: Register = on => {
           {branchRow}
           {tabBar}
           {divider}
-          {known?.error && <Text color="error">{known.error}</Text>}
-          {!known && <Text dimColor>Reading issues…</Text>}
-          {known && items.length === 0 && (
+          {list.error && <Text color="error">{list.error}</Text>}
+          {!list.isLoaded && !list.error && <Text dimColor>{list.readingText}</Text>}
+          {list.isLoaded && list.items.length === 0 && (
             <Box justifyContent="center">
-              <Text color="success">✔ No open issues</Text>
+              <Text color="success">{list.emptyText}</Text>
             </Box>
           )}
           {window.above > 0 && <Text dimColor> ↑ {window.above} above</Text>}
-          {items.slice(window.start, window.end).map(issue => {
-            const row = fitIssueRow(issue, width, ageOf(issue.updatedAt, at))
-            const tail = widthOf(row.label) + (row.label && row.age ? 1 : 0) + row.age.length
-            const pad = tail ? ' '.repeat(Math.max(1, width - row.head.length - widthOf(row.title) - tail)) : ''
-            return (
-              <Button key={`issue-${issue.number}`} plain onPress={press => void openUrl($, issue.url, press.surface)}>
-                <Text wrap="truncate-end">{`${row.head}${row.title}${pad}`}</Text>
-                {row.label && <Text dimColor>{row.label}</Text>}
-                {row.label && row.age ? ' ' : ''}
-                {row.age}
-              </Button>
-            )
-          })}
+          {list.items.slice(window.start, window.end).map(item => list.row(item, at) as never)}
           {window.below > 0 && (
-            <Button key="issues-more" plain dimColor onPress={press => void openUrl($, listUrl, press.surface)}>
+            <Button key={`${list.tab}-more`} plain dimColor onPress={press => void openUrl($, list.moreUrl, press.surface)}>
               {` ↓ ${window.below} more`}
             </Button>
           )}
           {divider}
-          {footer(known?.updatedAt ?? now.updatedAt)}
+          {footer(list.updatedAt)}
         </Box>
       )
+    }
+
+    if (tab === 'issues' && detection.kind === 'detected') {
+      return githubBody({
+        tab: 'issues',
+        items: known?.issues ?? [],
+        error: known?.error,
+        isLoaded: known !== null,
+        readingText: 'Reading issues…',
+        emptyText: '✔ No open issues',
+        moreUrl: `https://github.com/${detection.target}/issues`,
+        updatedAt: known?.updatedAt ?? now.updatedAt,
+        row: (issue, at) => {
+          const row = fitIssueRow(issue, width, ageOf(issue.updatedAt, at))
+          const tail = widthOf(row.label) + (row.label && row.age ? 1 : 0) + row.age.length
+          const pad = tail ? ' '.repeat(Math.max(1, width - row.head.length - widthOf(row.title) - tail)) : ''
+          return (
+            <Button key={`issue-${issue.number}`} plain onPress={press => void openUrl($, issue.url, press.surface)}>
+              <Text wrap="truncate-end">{`${row.head}${row.title}${pad}`}</Text>
+              {row.label && <Text dimColor>{row.label}</Text>}
+              {row.label && row.age ? ' ' : ''}
+              {row.age}
+            </Button>
+          )
+        },
+      })
+    }
+
+    if (tab === 'prs' && prSource.kind === 'ready') {
+      return githubBody({
+        tab: 'prs',
+        items: knownPrs?.prs ?? [],
+        error: knownPrs?.error,
+        isLoaded: knownPrs?.isLoaded ?? false,
+        readingText: 'Reading pull requests…',
+        emptyText: '✔ No open pull requests',
+        moreUrl: `https://github.com/${prSource.target}/pulls`,
+        updatedAt: knownPrs?.updatedAt ?? now.updatedAt,
+        row: (pr, at) => {
+          const row = fitPrRow(pr, width, ageOf(pr.updatedAt, at))
+          const tail = 1 + (row.age ? row.age.length + 1 : 0) // the mark, then a space and the age
+          const pad = ' '.repeat(Math.max(1, width - row.head.length - widthOf(row.title) - tail))
+          const isMine = me !== undefined && pr.author === me
+          const mark =
+            pr.mark === 'D' ? <Text dimColor>D</Text> : pr.mark ? <Text color={MARK_COLOR[pr.mark]}>{pr.mark}</Text> : ' '
+          return (
+            <Button key={`pr-${pr.number}`} plain onPress={press => void openUrl($, pr.url, press.surface)}>
+              <Text bold={isMine}>{row.head}</Text>
+              <Text wrap="truncate-end">{`${row.title}${pad}`}</Text>
+              {mark}
+              {row.age ? ` ${row.age}` : ''}
+            </Button>
+          )
+        },
+      })
     }
 
     const added = now.files.reduce((sum, file) => sum + (file.added ?? 0), 0)

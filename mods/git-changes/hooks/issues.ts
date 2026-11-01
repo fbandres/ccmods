@@ -89,24 +89,3 @@ export function fitIssueRow(issue: Issue, width: number, age: string) {
 
   return { head, title: cutTo(issue.title, width - head.length - tail()), label, age: shownAge }
 }
-
-const TAB_NAMES = [
-  ['Changes', 'Issues'],
-  ['Chg', 'Iss'],
-  ['C', 'I'],
-] as const
-
-/**
- * The two tab labels for `width` columns (one space between them): the active
- * one in brackets. Full names, then short ones, then letters, so the bar
- * stays on one row.
- */
-export function tabTexts(width: number, counts: { changes: string; issues: string }, active: 'changes' | 'issues') {
-  const text = (name: string, n: string, isActive: boolean) => (isActive ? `[${name} ${n}]` : ` ${name} ${n} `)
-  let texts = { changes: '', issues: '' }
-  for (const [changes, issues] of TAB_NAMES) {
-    texts = { changes: text(changes, counts.changes, active === 'changes'), issues: text(issues, counts.issues, active === 'issues') }
-    if (texts.changes.length + 1 + texts.issues.length <= width) break
-  }
-  return texts
-}

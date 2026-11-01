@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { ageOf, classifyGhFailure, fitIssueRow, issuesRepoOf, parseIssues, parseRemote, tabTexts } from './issues'
+import { ageOf, classifyGhFailure, fitIssueRow, issuesRepoOf, parseIssues, parseRemote } from './issues'
 import { widthOf } from './text'
 
 const SSH = 'git' // the scp-style ssh user, kept apart so the repo's leak scan doesn't read an email
@@ -116,15 +116,4 @@ test('fitIssueRow: wide titles and labels fit by columns, not characters', () =>
     expect(row.title.endsWith('…')).toBe(true)
   }
   expect(widthOf(fitIssueRow(issue, 48, '2d').label)).toBeLessThanOrEqual(10)
-})
-
-test('tabTexts: full names, then short, then letters, always within the width', () => {
-  expect(tabTexts(40, { changes: '2', issues: '5' }, 'changes')).toEqual({ changes: '[Changes 2]', issues: ' Issues 5 ' })
-  expect(tabTexts(40, { changes: '2', issues: '5' }, 'issues')).toEqual({ changes: ' Changes 2 ', issues: '[Issues 5]' })
-  expect(tabTexts(20, { changes: '999', issues: '100+' }, 'changes')).toEqual({ changes: '[Chg 999]', issues: ' Iss 100+ ' })
-  expect(tabTexts(20, { changes: '123456', issues: '100+' }, 'issues')).toEqual({ changes: ' C 123456 ', issues: '[I 100+]' })
-  for (const width of [20, 22, 25, 26, 30]) {
-    const t = tabTexts(width, { changes: '1234', issues: '100+' }, 'changes')
-    expect(t.changes.length + 1 + t.issues.length).toBeLessThanOrEqual(width)
-  }
 })

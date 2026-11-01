@@ -4,9 +4,11 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { FileChange, IssuesState, RepoStatus } from '../types'
 import { classifyGhFailure, ISSUES_LIMIT, issuesRepoOf, parseIssues } from './issues'
 import type { LineStat } from './status'
-import { ageOf, fitIssueRow, tabTexts } from './issues'
+import { ageOf, fitIssueRow } from './issues'
 import { followed, scrolled, stepOf, windowOf, wrapMove } from './scroll'
 import { countLines, fitRow, LETTER_COLOR, parseNumstat, parseStatus, withCounts } from './status'
+import type { TabId } from './tabs'
+import { tabTexts } from './tabs'
 import { widthOf } from './text'
 import type { Colors, ThemeEntry } from './theme'
 import { DEFAULT_THEMES, isRecord, isThemeNamed, MAX_INCLUDES, parseJsonc, pickBackground, stringsOf, THEME_SLUG, themeFile } from './theme'
@@ -38,10 +40,10 @@ let isFetching = false
 let fetchQueued = false // a tab press asked while a fetch ran: fetch once more after it
 let lastIssuesRaw: string | undefined
 
-type Tab = 'changes' | 'issues'
+type Tab = TabId
 let tab: Tab = 'changes'
 /** Each tab's first shown row: the mod scrolls its list itself, under a pinned header. */
-const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
+const offsets: Record<Tab, number> = { changes: 0, issues: 0, prs: 0 }
 /**
  * What each tab's last drawing measured, for ui.scroll and ui.focus: the list's
  * length, its rows of room, and its first body row. Per tab, so a hook that
@@ -50,6 +52,7 @@ const offsets: Record<Tab, number> = { changes: 0, issues: 0 }
 const drawn: Record<Tab, { length: number; room: number; top: number; bodyRows: number }> = {
   changes: { length: 0, room: 1, top: 0, bodyRows: 1 },
   issues: { length: 0, room: 1, top: 0, bodyRows: 1 },
+  prs: { length: 0, room: 1, top: 0, bodyRows: 1 },
 }
 
 /** The number of the issue row the ring was last on; a number survives a fetch that re-sorts the list. */
@@ -568,11 +571,28 @@ export const register: Register = on => {
 
     const issuesCount = !known ? '…' : known.isCapped ? `${ISSUES_LIMIT}+` : String(known.issues.length)
     const texts = tabTexts(width, { changes: String(count), issues: issuesCount }, tab)
-    const tabButton = (which: Tab, onPress: () => void) => (
-      <Button key={`tab-${which}`} plain onPress={onPress}>
-        {tab === which ? <Text bold>{texts[which]}</Text> : <Text dimColor>{texts[which]}</Text>}
-      </Button>
-    )
+    const tabButton = (which: Tab, onPress: () => void, countColor?: string) => {
+      const text = texts[which]
+      if (!text) return null
+      const count = <Text color={countColor}>{text.count}</Text>
+      return (
+        <Button key={`tab-${which}`} plain onPress={onPress}>
+          {tab === which ? (
+            <Text bold>
+              {text.before}
+              {count}
+              {text.after}
+            </Text>
+          ) : (
+            <Text dimColor>
+              {text.before}
+              {count}
+              {text.after}
+            </Text>
+          )}
+        </Button>
+      )
+    }
     const tabBar = hasTabs && (
       <Box gap={1}>
         {tabButton('changes', () => {
